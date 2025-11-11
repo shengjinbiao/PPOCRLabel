@@ -1,0 +1,32 @@
+
+
+# 启动标注程序，识别竖排中文文本，并使用 GPU
+> python PPOCRLabel.py --lang ch --text_layout vertical --gpu true
+
+# 划分数据集，按 8:2:0 的比例划分为训练集和验证集
+cd D:\PPOCRLabel
+python gen_ocr_train_val_test.py `
+  --datasetRootPath "D:\output_images - 副本" `
+  --detRootPath "D:\hnz_dataset_split\det" `
+  --recRootPath "D:\hnz_dataset_split\rec" `
+  --trainValTestRatio 8:2:0
+
+# 使用划分好的数据集进行检测模型训练
+cd D:\PaddleOCR
+python tools/train.py -c configs/det/PP-OCRv4/PP-OCRv4_mobile_det.yml `
+  -o Global.use_gpu=True `
+     Global.save_model_dir="D:\hnz_models\det_db" `
+     Train.loader.batch_size_per_card=2 `
+     Global.epoch_num=100 `
+     Train.dataset.data_dir="D:\hnz_dataset_split\det" `
+     Train.dataset.label_file_list=["D:/hnz_dataset_split/det/train.txt"] `
+     Eval.dataset.data_dir="D:\hnz_dataset_split\det" `
+     Eval.dataset.label_file_list=["D:/hnz_dataset_split/det/val.txt"]
+
+# 使用划分好的数据集进行检测模型评估
+     python tools/eval.py -c configs/det/PP-OCRv5/PP-OCRv5_mobile_det.yml `
+  -o Global.use_gpu=True `
+     Global.checkpoints="D:\hnz_models\det_db\iter_epoch_20" `
+     Eval.dataset.data_dir="D:\hnz_dataset_split\det" `
+     Eval.dataset.label_file_list=["D:/hnz_dataset_split/det/test.txt"]
+

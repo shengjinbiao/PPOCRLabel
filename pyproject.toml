@@ -8,6 +8,8 @@ dynamic = ["version"]
 dependencies = [
   "pyqt5",
   "paddleocr>=3.0.2",
+  "paddlepaddle-gpu>=3.2.1",
+  "paddlex[ocr]>=3.3.9",
   "openpyxl",
   "tqdm",
   "premailer",

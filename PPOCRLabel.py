@@ -21,6 +21,8 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
+import shutil
 from functools import partial
 
 import openpyxl
@@ -36,6 +38,7 @@ from PyQt5.QtCore import (
     QFileInfo,
     QPointF,
     QProcess,
+    pyqtSignal,
 )
 from PyQt5.QtGui import (
     QImage,
@@ -45,6 +48,7 @@ from PyQt5.QtGui import (
     QColor,
     QIcon,
     QFontDatabase,
+    QTextCursor,
 )
 from PyQt5.QtWidgets import (
     QMainWindow,
@@ -71,7 +75,10 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QMenu,
     QAction,
+    QActionGroup,
     QPushButton,
+    QPlainTextEdit,
+    QInputDialog,
 )
 
 __dir__ = os.path.dirname(__file__)
@@ -97,6 +104,13 @@ from libs.constants import (
     SETTING_WIN_POSE,
     SETTING_WIN_SIZE,
     SETTING_WIN_STATE,
+    SETTING_TEXT_LAYOUT_MODE,
+    SETTING_TRAIN_REPO_DIR,
+    SETTING_TRAIN_DATASET_DIR,
+    SETTING_TRAIN_OUTPUT_DIR,
+    SETTING_TRAIN_CONFIG_PATH,
+    SETTING_TRAIN_BATCH_SIZE,
+    SETTING_TRAIN_EPOCHS,
 )
 from libs.utils import (
     addActions,
@@ -140,6 +154,46 @@ __appname__ = "PPOCRLabel"
 LABEL_COLORMAP = label_colormap()
 
 
+class TrainingLogDialog(QDialog):
+    stopRequested = pyqtSignal()
+
+    def __init__(self, parent=None, title="PaddleOCR Training", stop_label="Stop", close_label="Close"):
+        super(TrainingLogDialog, self).__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(720, 420)
+        self.logView = QPlainTextEdit(self)
+        self.logView.setReadOnly(True)
+        self.stopButton = QPushButton(stop_label, self)
+        self.closeButton = QPushButton(close_label, self)
+        buttonLayout = QHBoxLayout()
+        buttonLayout.addStretch(1)
+        buttonLayout.addWidget(self.stopButton)
+        buttonLayout.addWidget(self.closeButton)
+        layout = QVBoxLayout()
+        layout.addWidget(self.logView)
+        layout.addLayout(buttonLayout)
+        self.setLayout(layout)
+        self.stopButton.clicked.connect(self._handle_stop)
+        self.closeButton.clicked.connect(self.reject)
+        self._stop_enabled = True
+
+    def _handle_stop(self):
+        if not self._stop_enabled:
+            return
+        self.stopButton.setEnabled(False)
+        self._stop_enabled = False
+        self.stopRequested.emit()
+
+    def append_text(self, text):
+        if not text:
+            return
+        self.logView.moveCursor(QTextCursor.End)
+        self.logView.insertPlainText(text)
+        self.logView.moveCursor(QTextCursor.End)
+
+    def set_running(self, running):
+        self._stop_enabled = running
+        self.stopButton.setEnabled(running)
 class MainWindow(QMainWindow):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = list(range(3))
 
@@ -158,6 +212,7 @@ class MainWindow(QMainWindow):
         cls_model_dir=None,
         label_font_path=None,
         selected_shape_color=(255, 255, 0),
+        text_layout_mode=None,
     ):
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
@@ -172,6 +227,9 @@ class MainWindow(QMainWindow):
         self.gpu = "gpu" if paddle.is_compiled_with_cuda() and gpu else "cpu"
         self.img_list_natural_sort = img_list_natural_sort
         self.bbox_auto_zoom_center = bbox_auto_zoom_center
+        self.det_model_dir = det_model_dir
+        self.rec_model_dir = rec_model_dir
+        self.cls_model_dir = cls_model_dir
 
         # Load string bundle for i18n
         if lang not in ["ch", "en"]:
@@ -182,6 +240,7 @@ class MainWindow(QMainWindow):
 
         def get_str(str_id):
             return self.stringBundle.getString(str_id)
+        self.get_str = get_str
 
         # KIE setting
         self.kie_mode = kie_mode
@@ -191,43 +250,25 @@ class MainWindow(QMainWindow):
 
         self.defaultSaveDir = default_save_dir
 
-        params = {
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": False,
-            "device": self.gpu,
-            "lang": self.lang,
-            "text_detection_model_name": "PP-OCRv5_mobile_det",
-            "text_recognition_model_name": "PP-OCRv5_mobile_rec",
-            "enable_mkldnn": False,
-        }
+        stored_layout_mode = settings.get(SETTING_TEXT_LAYOUT_MODE)
+        if text_layout_mode is not None:
+            self.text_layout_mode = text_layout_mode
+        elif stored_layout_mode is not None:
+            self.text_layout_mode = stored_layout_mode
+        else:
+            self.text_layout_mode = "horizontal"
+        self.use_vertical_text = self.text_layout_mode == "vertical"
+        self.settings[SETTING_TEXT_LAYOUT_MODE] = self.text_layout_mode
 
-        if det_model_dir is not None:
-            params["text_detection_model_dir"] = det_model_dir
-        if rec_model_dir is not None:
-            params["text_recognition_model_dir"] = rec_model_dir
-        if cls_model_dir is not None:
-            params["text_line_orientation_model_dir"] = cls_model_dir
-
-        self.ocr = PaddleOCR(**params)
+        self._reload_ocr_backends()
         self.text_recognizer = TextRecognition(
             model_name="PP-OCRv5_mobile_rec",
-            model_dir=rec_model_dir,
+            model_dir=self.rec_model_dir,
             device=self.gpu,
         )
         self.text_detector = TextDetection(
             model_name="PP-OCRv5_mobile_det",
-            model_dir=det_model_dir,
-            device=self.gpu,
-        )
-        self.table_ocr = PPStructureV3(
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_seal_recognition=False,
-            use_table_recognition=True,
-            use_formula_recognition=False,
-            use_chart_recognition=False,
-            use_region_detection=False,
+            model_dir=self.det_model_dir,
             device=self.gpu,
         )
 
@@ -245,8 +286,11 @@ class MainWindow(QMainWindow):
         self.result_dic_locked = []
         self.changeFileFolder = False
         self.haveAutoReced = False
+        self.trainingProcess = None
+        self.trainingDialog = None
         self.labelFile = None
         self.currIndex = 0
+        self._currentAutoSplitDir = None
 
         # Whether we need to save or not.
         self.dirty = False
@@ -763,6 +807,21 @@ class MainWindow(QMainWindow):
             get_str("autoRecognition"),
             enabled=False,
         )
+        AutoRecCurrent = action(
+            get_str("autoRecognitionCurrent"),
+            self.autoRecognitionCurrent,
+            "",
+            "Auto",
+            get_str("autoRecognitionCurrentDetail"),
+            enabled=False,
+        )
+        trainAction = action(
+            get_str("startTraining"),
+            self.launchPaddleTraining,
+            "",
+            "next",
+            get_str("startTrainingDetail"),
+        )
 
         reRec = action(
             get_str("reRecognition"),
@@ -912,6 +971,10 @@ class MainWindow(QMainWindow):
         self.DelButton.setDefaultAction(deleteImg)
         self.SaveButton.setDefaultAction(save)
         self.AutoRecognition.setDefaultAction(AutoRec)
+        self.autoRecognitionMenu = QMenu(self)
+        self.autoRecognitionMenu.addAction(AutoRecCurrent)
+        self.AutoRecognition.setMenu(self.autoRecognitionMenu)
+        self.AutoRecognition.setPopupMode(QToolButton.MenuButtonPopup)
         self.reRecogButton.setDefaultAction(reRec)
         self.tableRecButton.setDefaultAction(tableRec)
         self.ResortButton.setDefaultAction(resort)
@@ -966,6 +1029,29 @@ class MainWindow(QMainWindow):
         self.drawSquaresOption.setChecked(settings.get(SETTING_DRAW_SQUARE, False))
         self.drawSquaresOption.triggered.connect(self.toogleDrawSquare)
 
+        layout_horizontal = action(
+            get_str("textLayoutHorizontal"),
+            lambda: self.changeTextLayoutMode("horizontal"),
+            tip=get_str("textLayoutHorizontalDetail"),
+            checkable=True,
+        )
+        layout_vertical = action(
+            get_str("textLayoutVertical"),
+            lambda: self.changeTextLayoutMode("vertical"),
+            tip=get_str("textLayoutVerticalDetail"),
+            checkable=True,
+        )
+        self.layoutActionGroup = QActionGroup(self)
+        self.layoutActionGroup.setExclusive(True)
+        self.layoutActionGroup.addAction(layout_horizontal)
+        self.layoutActionGroup.addAction(layout_vertical)
+        layout_horizontal.setChecked(not self.use_vertical_text)
+        layout_vertical.setChecked(self.use_vertical_text)
+        self.textLayoutMenu = QMenu(get_str("textLayoutMenu"), self)
+        self.textLayoutMenu.addAction(layout_horizontal)
+        self.textLayoutMenu.addAction(layout_vertical)
+        self.textLayoutMenu.setStatusTip(get_str("textLayoutMenuDetail"))
+
         # Store actions for further handling.
         self.actions = struct(
             save=save,
@@ -981,8 +1067,10 @@ class MainWindow(QMainWindow):
             saveRec=saveRec,
             singleRere=singleRere,
             AutoRec=AutoRec,
+            AutoRecCurrent=AutoRecCurrent,
             reRec=reRec,
             cellreRec=cellreRec,
+            train=trainAction,
             createMode=createMode,
             editMode=editMode,
             shapeLineColor=shapeLineColor,
@@ -1159,7 +1247,20 @@ class MainWindow(QMainWindow):
             ),
         )
 
-        addActions(self.menus.autolabel, (AutoRec, reRec, cellreRec, alcm, None, help))
+        addActions(
+            self.menus.autolabel,
+            (
+                AutoRec,
+                AutoRecCurrent,
+                reRec,
+                cellreRec,
+                trainAction,
+                self.textLayoutMenu,
+                alcm,
+                None,
+                help,
+            ),
+        )
 
         self.menus.file.aboutToShow.connect(self.updateFileMenu)
 
@@ -1254,6 +1355,48 @@ class MainWindow(QMainWindow):
 
         # selected shape color
         self.selected_shape_color = selected_shape_color
+
+    def _paddleocr_params(self, lang=None):
+        params = {
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": self.use_vertical_text,
+            "device": self.gpu,
+            "lang": lang or self.lang,
+            "text_detection_model_name": "PP-OCRv5_mobile_det",
+            "text_recognition_model_name": "PP-OCRv5_mobile_rec",
+            "enable_mkldnn": False,
+        }
+        if self.det_model_dir is not None:
+            params["text_detection_model_dir"] = self.det_model_dir
+        if self.rec_model_dir is not None:
+            params["text_recognition_model_dir"] = self.rec_model_dir
+        if self.cls_model_dir is not None:
+            params["text_line_orientation_model_dir"] = self.cls_model_dir
+        return params
+
+    def _build_table_ocr(self, lang=None):
+        kwargs = dict(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_seal_recognition=False,
+            use_table_recognition=True,
+            use_formula_recognition=False,
+            use_chart_recognition=False,
+            use_region_detection=False,
+            use_textline_orientation=self.use_vertical_text,
+            device=self.gpu,
+            lang=lang or self.lang,
+        )
+        if self.cls_model_dir is not None:
+            kwargs["textline_orientation_model_dir"] = self.cls_model_dir
+        return PPStructureV3(**kwargs)
+
+    def _reload_ocr_backends(self, lang=None):
+        if lang is not None:
+            self.lang = lang
+        self.ocr = PaddleOCR(**self._paddleocr_params(lang=lang))
+        self.table_ocr = self._build_table_ocr(lang=lang)
 
     def menu(self, title, actions=None):
         menu = self.menuBar().addMenu(title)
@@ -2170,6 +2313,8 @@ class MainWindow(QMainWindow):
             self.status("Loaded %s" % os.path.basename(unicodeFilePath))
             self.image = image
             self.filePath = unicodeFilePath
+            if unicodeFilePath in self.mImgList:
+                self.currIndex = self.mImgList.index(unicodeFilePath)
             self.canvas.loadPixmap(QPixmap.fromImage(image))
 
             if self.validFilestate(filePath) is True:
@@ -2519,6 +2664,7 @@ class MainWindow(QMainWindow):
         self.reRecogButton.setEnabled(True)
         self.tableRecButton.setEnabled(True)
         self.actions.AutoRec.setEnabled(True)
+        self.actions.AutoRecCurrent.setEnabled(True)
         self.actions.reRec.setEnabled(True)
         self.actions.tableRec.setEnabled(True)
         self.actions.open_dataset_dir.setEnabled(True)
@@ -2928,17 +3074,53 @@ class MainWindow(QMainWindow):
         end_index = min(self.currIndex + self.auto_recognition_num, len(self.mImgList))
         images_to_check = self.mImgList[start_index:end_index]
 
-        recorded_basenames = [
+        self._start_auto_recognition(images_to_check)
+
+    def autoRecognitionCurrent(self):
+        assert self.mImgList is not None
+        if not self.mImgList:
+            return
+        logger.info("Auto recognition limited to current page")
+        current_image = [self.mImgList[self.currIndex]]
+        self._start_auto_recognition(
+            current_image, ignore_processed=True, force_images=current_image
+        )
+
+    def _start_auto_recognition(
+        self, images_to_check, ignore_processed=True, force_images=None
+    ):
+        if not images_to_check:
+            QMessageBox.information(
+                self,
+                "Information",
+                self.stringBundle.getString("autoRecognitionNoPending"),
+            )
+            return
+
+        force_set = set(force_images) if force_images else set()
+        recorded_basenames = {
             os.path.basename(path)
             for path in self.fileStatedict.keys()
             if self.fileStatedict[path] == 1
-        ]
+        } if ignore_processed else set()
 
         uncheckedList = []
         for image_path in images_to_check:
             image_basename = os.path.basename(image_path)
-            if image_basename not in recorded_basenames:
+            if (
+                not ignore_processed
+                or image_basename not in recorded_basenames
+                or image_path in force_set
+            ):
                 uncheckedList.append(image_path)
+
+        if not uncheckedList:
+            QMessageBox.information(
+                self,
+                "Information",
+                self.stringBundle.getString("autoRecognitionNoPending"),
+            )
+            return
 
         self.autoDialog = AutoDialog(
             parent=self,
@@ -2953,6 +3135,294 @@ class MainWindow(QMainWindow):
         self.saveCacheLabel()
 
         self.init_key_list(self.Cachelabel)
+
+    def launchPaddleTraining(self):
+        if self.trainingProcess and self.trainingProcess.state() != QProcess.NotRunning:
+            QMessageBox.information(
+                self, "Information", self.get_str("trainingAlreadyRunning")
+            )
+            if self.trainingDialog:
+                self.trainingDialog.show()
+                self.trainingDialog.raise_()
+            return
+
+        repo_dir_default = self.settings.get(SETTING_TRAIN_REPO_DIR, "")
+        repo_dir = QFileDialog.getExistingDirectory(
+            self, self.get_str("selectPaddleRepo"), repo_dir_default or "."
+        )
+        if not repo_dir:
+            return
+        self.settings[SETTING_TRAIN_REPO_DIR] = repo_dir
+
+        config_default = self.settings.get(SETTING_TRAIN_CONFIG_PATH, "")
+        start_dir = config_default or os.path.join(repo_dir, "configs")
+        config_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.get_str("selectTrainConfig"),
+            start_dir,
+            "YAML Files (*.yml *.yaml)",
+        )
+        if not config_path:
+            return
+        self.settings[SETTING_TRAIN_CONFIG_PATH] = config_path
+
+        dataset_dir = None
+        auto_split_root = None
+        current_dir = self.lastOpenDir
+        label_exists = current_dir and os.path.isfile(os.path.join(current_dir, "Label.txt"))
+        if label_exists:
+            reply = QMessageBox.question(
+                self,
+                self.get_str("trainingDialogTitle"),
+                self.get_str("autoSplitPrompt"),
+            )
+            if reply == QMessageBox.Yes:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    dataset_dir, auto_split_root = self._prepare_dataset_from_current(
+                        current_dir
+                    )
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Warning",
+                        self.get_str("autoSplitFailed").format(str(e)),
+                    )
+                    dataset_dir = None
+                    auto_split_root = None
+                finally:
+                    QApplication.restoreOverrideCursor()
+        if not dataset_dir:
+            dataset_default = self.settings.get(
+                SETTING_TRAIN_DATASET_DIR, current_dir or ""
+            )
+            dataset_dir = QFileDialog.getExistingDirectory(
+                self, self.get_str("selectTrainDataset"), dataset_default or "."
+            )
+            if not dataset_dir:
+                return
+        train_txt = os.path.join(dataset_dir, "train.txt")
+        val_txt = os.path.join(dataset_dir, "val.txt")
+        if not (os.path.exists(train_txt) and os.path.exists(val_txt)):
+            QMessageBox.warning(
+                self, "Warning", self.get_str("trainingMissingSplits")
+            )
+            if auto_split_root:
+                shutil.rmtree(auto_split_root, ignore_errors=True)
+            return
+        self.settings[SETTING_TRAIN_DATASET_DIR] = dataset_dir
+
+        output_default = self.settings.get(SETTING_TRAIN_OUTPUT_DIR, dataset_dir)
+        output_dir = QFileDialog.getExistingDirectory(
+            self, self.get_str("selectTrainOutput"), output_default or "."
+        )
+        if not output_dir:
+            if auto_split_root:
+                shutil.rmtree(auto_split_root, ignore_errors=True)
+            return
+        self.settings[SETTING_TRAIN_OUTPUT_DIR] = output_dir
+
+        batch_default = self.settings.get(SETTING_TRAIN_BATCH_SIZE, 2)
+        batch_size, ok = QInputDialog.getInt(
+            self,
+            self.get_str("trainingDialogTitle"),
+            self.get_str("trainingBatchPrompt"),
+            int(batch_default),
+            1,
+            1024,
+        )
+        if not ok:
+            return
+        self.settings[SETTING_TRAIN_BATCH_SIZE] = batch_size
+
+        epoch_default = self.settings.get(SETTING_TRAIN_EPOCHS, 100)
+        epochs, ok = QInputDialog.getInt(
+            self,
+            self.get_str("trainingDialogTitle"),
+            self.get_str("trainingEpochPrompt"),
+            int(epoch_default),
+            1,
+            5000,
+        )
+        if not ok:
+            return
+        self.settings[SETTING_TRAIN_EPOCHS] = epochs
+
+        self.settings.save()
+
+        self._start_training_process(
+            repo_dir,
+            config_path,
+            dataset_dir,
+            output_dir,
+            batch_size,
+            epochs,
+            auto_split_root,
+        )
+
+    def _start_training_process(
+        self,
+        repo_dir,
+        config_path,
+        dataset_dir,
+        output_dir,
+        batch_size,
+        epochs,
+        auto_split_root,
+    ):
+        script_path = os.path.join(repo_dir, "tools", "train.py")
+        if not os.path.exists(script_path):
+            QMessageBox.warning(
+                self, "Warning", self.get_str("trainingStartFailed")
+            )
+            return
+
+        train_txt = os.path.normpath(os.path.join(dataset_dir, "train.txt"))
+        val_txt = os.path.normpath(os.path.join(dataset_dir, "val.txt"))
+
+        if not (os.path.exists(train_txt) and os.path.exists(val_txt)):
+            QMessageBox.warning(
+                self, "Warning", self.get_str("trainingMissingSplits")
+            )
+            return
+
+        norm = lambda p: os.path.normpath(p).replace("\\", "/")
+        args = [
+            script_path,
+            "-c",
+            config_path,
+            "-o",
+            f"Global.use_gpu={'true' if self.gpu == 'gpu' else 'false'}",
+            f"Global.save_model_dir={norm(output_dir)}",
+            f"Train.loader.batch_size_per_card={batch_size}",
+            f"Global.epoch_num={epochs}",
+            f"Train.dataset.data_dir={norm(dataset_dir)}",
+            f'Train.dataset.label_file_list=["{norm(train_txt)}"]',
+            f"Eval.dataset.data_dir={norm(dataset_dir)}",
+            f'Eval.dataset.label_file_list=["{norm(val_txt)}"]',
+        ]
+
+        self.trainingProcess = QProcess(self)
+        self.trainingProcess.setProcessChannelMode(QProcess.MergedChannels)
+        self.trainingProcess.setWorkingDirectory(repo_dir)
+        self.trainingProcess.readyReadStandardOutput.connect(
+            self._handle_training_output
+        )
+        self.trainingProcess.finished.connect(self._training_finished)
+        self._currentAutoSplitDir = auto_split_root
+
+        self.trainingDialog = TrainingLogDialog(
+            self,
+            title=self.get_str("trainingDialogTitle"),
+            stop_label=self.get_str("trainingStop"),
+            close_label=self.get_str("trainingClose"),
+        )
+        self.trainingDialog.stopRequested.connect(self._stop_training_process)
+        self.trainingDialog.finished.connect(self._training_dialog_closed)
+        self.trainingDialog.show()
+        self.trainingDialog.set_running(True)
+
+        self.trainingProcess.start(sys.executable, args)
+        if not self.trainingProcess.waitForStarted(5000):
+            self.trainingDialog.append_text(self.get_str("trainingStartFailed") + "\n")
+            self.trainingDialog.set_running(False)
+            QMessageBox.warning(self, "Warning", self.get_str("trainingStartFailed"))
+            self.trainingProcess = None
+            if self._currentAutoSplitDir:
+                shutil.rmtree(self._currentAutoSplitDir, ignore_errors=True)
+                self._currentAutoSplitDir = None
+            self.trainingDialog = None
+            return
+        command_preview = f"{sys.executable} " + " ".join(f'"{arg}"' if " " in arg else arg for arg in args)
+        self.trainingDialog.append_text(command_preview + "\n\n")
+
+    def _handle_training_output(self):
+        if not self.trainingProcess:
+            return
+        data = bytes(self.trainingProcess.readAllStandardOutput()).decode(
+            errors="ignore"
+        )
+        if self.trainingDialog:
+            self.trainingDialog.append_text(data)
+
+    def _training_finished(self, exitCode, _exitStatus):
+        if self.trainingDialog:
+            message = self.get_str("trainingCompleted").format(exitCode)
+            self.trainingDialog.append_text("\n" + message + "\n")
+            self.trainingDialog.set_running(False)
+        if self.trainingProcess:
+            self.trainingProcess = None
+        if self._currentAutoSplitDir:
+            shutil.rmtree(self._currentAutoSplitDir, ignore_errors=True)
+            self._currentAutoSplitDir = None
+
+    def _stop_training_process(self):
+        if self.trainingProcess and self.trainingProcess.state() != QProcess.NotRunning:
+            self.trainingProcess.terminate()
+            proc = self.trainingProcess
+
+            def kill_later():
+                if proc.state() != QProcess.NotRunning:
+                    proc.kill()
+
+            QTimer.singleShot(5000, kill_later)
+        if self.trainingDialog:
+            self.trainingDialog.append_text("\n" + self.get_str("trainingStopped") + "\n")
+            self.trainingDialog.set_running(False)
+
+    def _training_dialog_closed(self, _result):
+        self.trainingDialog = None
+
+    def _prepare_dataset_from_current(self, source_dir, ratio="8:2:0"):
+        split_root = tempfile.mkdtemp(prefix="ppocrlabel_split_")
+        det_root = os.path.join(split_root, "det")
+        rec_root = os.path.join(split_root, "rec")
+        script_path = os.path.join(os.path.dirname(__file__), "gen_ocr_train_val_test.py")
+        cmd = [
+            sys.executable,
+            script_path,
+            "--datasetRootPath",
+            source_dir,
+            "--detRootPath",
+            det_root,
+            "--recRootPath",
+            rec_root,
+            "--trainValTestRatio",
+            ratio,
+        ]
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(__file__),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            shutil.rmtree(split_root, ignore_errors=True)
+            raise RuntimeError(result.stderr or result.stdout or "split failed")
+        return det_root, split_root
+
+    def changeTextLayoutMode(self, mode):
+        if mode == self.text_layout_mode:
+            return
+        if mode not in ["horizontal", "vertical"]:
+            logger.warning("Unsupported text layout mode: %s", mode)
+            return
+        self.text_layout_mode = mode
+        self.use_vertical_text = self.text_layout_mode == "vertical"
+        self.settings[SETTING_TEXT_LAYOUT_MODE] = self.text_layout_mode
+        self.settings.save()
+        self._reload_ocr_backends()
+        layout_label = (
+            self.stringBundle.getString("textLayoutVertical")
+            if self.use_vertical_text
+            else self.stringBundle.getString("textLayoutHorizontal")
+        )
+        self.statusBar().showMessage(
+            "{}: {}".format(
+                self.stringBundle.getString("textLayoutMenu"), layout_label
+            ),
+            3000,
+        )
 
     def reRecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -3386,6 +3856,7 @@ class MainWindow(QMainWindow):
         if self.filePath:
             self.AutoRecognition.setEnabled(True)
             self.actions.AutoRec.setEnabled(True)
+            self.actions.AutoRecCurrent.setEnabled(True)
 
     def modelChoose(self):
         current_text = self.comboBox.currentText()
@@ -3400,30 +3871,7 @@ class MainWindow(QMainWindow):
         }
         if current_text in lg_idx:
             choose_lang = lg_idx[current_text]
-            if hasattr(self, "ocr"):
-                del self.ocr
-                self.ocr = PaddleOCR(
-                    use_doc_orientation_classify=False,
-                    use_textline_orientation=False,
-                    use_doc_unwarping=False,
-                    text_detection_model_name="PP-OCRv5_mobile_det",
-                    text_recognition_model_name="PP-OCRv5_mobile_rec",
-                    lang=choose_lang,
-                    device=self.gpu,
-                )
-            if choose_lang in ["ch", "en"]:
-                if hasattr(self, "table_ocr"):
-                    del self.table_ocr
-                self.table_ocr = PPStructureV3(
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_seal_recognition=False,
-                    use_table_recognition=True,
-                    use_formula_recognition=False,
-                    use_chart_recognition=False,
-                    use_region_detection=False,
-                    device=self.gpu,
-                )
+            self._reload_ocr_backends(lang=choose_lang)
         else:
             logger.error("Invalid language selection")
         self.dialog.close()
@@ -3822,6 +4270,14 @@ def get_main_app(argv=[]):
         nargs="?",
         help='An RGB value as "R,G,B".',
     )
+    arg_parser.add_argument(
+        "--text_layout",
+        type=str,
+        choices=["horizontal", "vertical"],
+        default=None,
+        nargs="?",
+        help="Preferred text layout direction for OCR inference.",
+    )
 
     args = arg_parser.parse_args(argv[1:])
 
@@ -3837,6 +4293,7 @@ def get_main_app(argv=[]):
         bbox_auto_zoom_center=args.bbox_auto_zoom_center,
         label_font_path=args.label_font_path,
         selected_shape_color=args.selected_shape_color,
+        text_layout_mode=args.text_layout,
     )
     win.show()
     return app, win
