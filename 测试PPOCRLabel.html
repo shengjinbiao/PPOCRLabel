@@ -40,3 +40,12 @@ python PPOCRLabel.py `  --det_model_dir "C:\Users\sheng\.paddlex\official_models
 >>   --gpu true `
 >>   --det_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_mobile_det" `
 >>   --rec_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_mobile_rec"
+
+#  导出模型
+(ppocrlabel) PS D:\PaddleOCR> python .\tools\export_model.py -c .\configs\det\PP-OCRv4\PP-OCRv4_mobile_det.yml -o Global.checkpoints="D:\hnz_models\det_db\best_model\model"  Global.save_inference_dir="D:\hnz_models\det_db\best_model_infer"
+
+# 使用server模型，更多的参数，需要更多的资源，也许效果更好？
+conda activate ppocrlabel
+python .\PPOCRLabel.py `
+  --det_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_server_det" `
+  --rec_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_server_rec"

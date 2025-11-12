@@ -15,6 +15,8 @@ PPOCRLabelv3 is a semi-automatic graphic annotation tool suitable for OCR field,
 | <img src="./data/gif/multi-point.gif" width="80%"/> |  <img src="./data/gif/kie.gif" width="100%"/>  |
 
 ### Recent Update
+- 2025.11:
+  - Training jobs started from the menu now auto-export the latest checkpoint with `tools/export_model.py`, store it under `inference_<timestamp>` in the selected output directory, register the folder as the current custom detection model, and reload PaddleOCR/PP-Structure immediately so the new model is active without manual switching.
 - 2025.06:
   - Add the `Resort Bounding Box Positions` features. For usage details, please refer to the `11. Additional Feature Description` in the `2.1 Operational Steps` section below.
 - 2024.11:

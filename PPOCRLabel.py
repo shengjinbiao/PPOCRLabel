@@ -16,6 +16,7 @@
 import argparse
 import ast
 import codecs
+import datetime
 import json
 import os
 import platform
@@ -236,6 +237,11 @@ class MainWindow(QMainWindow):
         self.settings = Settings()
         self.settings.load()
         settings = self.settings
+        auto_export = settings.get(SETTING_TRAIN_AUTO_EXPORT)
+        if auto_export is None:
+            auto_export = True
+        self.auto_export_trained_model = bool(auto_export)
+        self.settings[SETTING_TRAIN_AUTO_EXPORT] = self.auto_export_trained_model
         self.lang = lang
         self.gpu = "gpu" if paddle.is_compiled_with_cuda() and gpu else "cpu"
         self.img_list_natural_sort = img_list_natural_sort
@@ -279,16 +285,25 @@ class MainWindow(QMainWindow):
         self.settings[SETTING_READING_ORDER] = self.reading_mode
 
         self._reload_ocr_backends()
-        self.text_recognizer = TextRecognition(
-            model_name="PP-OCRv5_mobile_rec",
-            model_dir=self.rec_model_dir,
-            device=self.gpu,
-        )
-        self.text_detector = TextDetection(
-            model_name="PP-OCRv5_mobile_det",
-            model_dir=self.det_model_dir,
-            device=self.gpu,
-        )
+        rec_kwargs = {
+            "device": self.gpu,
+            "model_name": self._infer_model_name(
+                self.rec_model_dir, "PP-OCRv5_mobile_rec"
+            ),
+        }
+        if self.rec_model_dir:
+            rec_kwargs["model_dir"] = self.rec_model_dir
+        self.text_recognizer = TextRecognition(**rec_kwargs)
+
+        det_kwargs = {
+            "device": self.gpu,
+            "model_name": self._infer_model_name(
+                self.det_model_dir, "PP-OCRv5_mobile_det"
+            ),
+        }
+        if self.det_model_dir:
+            det_kwargs["model_dir"] = self.det_model_dir
+        self.text_detector = TextDetection(**det_kwargs)
 
         if os.path.exists("./data/paddle.png"):
             self.ocr.predict("./data/paddle.png")
@@ -309,6 +324,10 @@ class MainWindow(QMainWindow):
         self.labelFile = None
         self.currIndex = 0
         self._currentAutoSplitDir = None
+        self._pendingTrainJob = None
+        self._exportProcess = None
+        self._pendingExportInfo = None
+        self._exportLogBuffer = ""
 
         # Whether we need to save or not.
         self.dirty = False
@@ -1416,13 +1435,19 @@ class MainWindow(QMainWindow):
             "use_textline_orientation": self.use_vertical_text,
             "device": self.gpu,
             "lang": lang or self.lang,
-            "text_detection_model_name": "PP-OCRv5_mobile_det",
-            "text_recognition_model_name": "PP-OCRv5_mobile_rec",
             "enable_mkldnn": False,
         }
-        if self.det_model_dir is not None:
+        det_name = self._infer_model_name(
+            self.det_model_dir, default_name="PP-OCRv5_mobile_det"
+        )
+        rec_name = self._infer_model_name(
+            self.rec_model_dir, default_name="PP-OCRv5_mobile_rec"
+        )
+        params["text_detection_model_name"] = det_name
+        params["text_recognition_model_name"] = rec_name
+        if self.det_model_dir:
             params["text_detection_model_dir"] = self.det_model_dir
-        if self.rec_model_dir is not None:
+        if self.rec_model_dir:
             params["text_recognition_model_dir"] = self.rec_model_dir
         if self.cls_model_dir is not None:
             params["text_line_orientation_model_dir"] = self.cls_model_dir
@@ -3354,6 +3379,11 @@ class MainWindow(QMainWindow):
             f"Eval.dataset.data_dir={norm(dataset_dir)}",
             f'Eval.dataset.label_file_list=["{norm(val_txt)}"]',
         ]
+        self._pendingTrainJob = {
+            "repo_dir": repo_dir,
+            "config_path": config_path,
+            "output_dir": output_dir,
+        }
 
         self.trainingProcess = QProcess(self)
         self.trainingProcess.setProcessChannelMode(QProcess.MergedChannels)
@@ -3381,6 +3411,7 @@ class MainWindow(QMainWindow):
             self.trainingDialog.set_running(False)
             QMessageBox.warning(self, "Warning", self.get_str("trainingStartFailed"))
             self.trainingProcess = None
+            self._pendingTrainJob = None
             if self._currentAutoSplitDir:
                 shutil.rmtree(self._currentAutoSplitDir, ignore_errors=True)
                 self._currentAutoSplitDir = None
@@ -3408,6 +3439,10 @@ class MainWindow(QMainWindow):
         if self._currentAutoSplitDir:
             shutil.rmtree(self._currentAutoSplitDir, ignore_errors=True)
             self._currentAutoSplitDir = None
+        job = self._pendingTrainJob
+        self._pendingTrainJob = None
+        if exitCode == 0 and job and self.auto_export_trained_model:
+            self._maybe_start_auto_export(job)
 
     def _stop_training_process(self):
         if self.trainingProcess and self.trainingProcess.state() != QProcess.NotRunning:
@@ -3425,6 +3460,171 @@ class MainWindow(QMainWindow):
 
     def _training_dialog_closed(self, _result):
         self.trainingDialog = None
+
+    def _maybe_start_auto_export(self, job):
+        if self._exportProcess:
+            logger.warning("Auto export already running, skip new request.")
+            return
+        repo_dir = job.get("repo_dir")
+        config_path = job.get("config_path")
+        output_dir = job.get("output_dir")
+        if not (repo_dir and config_path and output_dir):
+            return
+        script_path = os.path.join(repo_dir, "tools", "export_model.py")
+        if not os.path.exists(script_path):
+            self._show_export_failure(
+                f"tools/export_model.py not found under: {repo_dir}"
+            )
+            return
+        checkpoint_prefix = self._find_latest_checkpoint(output_dir)
+        if not checkpoint_prefix:
+            self._show_export_failure(
+                f"No checkpoint (.pdparams) found in: {output_dir}"
+            )
+            return
+        inference_dir = self._next_inference_dir(output_dir)
+        norm = lambda p: os.path.normpath(p).replace("\\", "/")
+        args = [
+            script_path,
+            "-c",
+            config_path,
+            "-o",
+            f"Global.checkpoints={norm(checkpoint_prefix)}",
+            f"Global.save_inference_dir={norm(inference_dir)}",
+        ]
+        self._exportProcess = QProcess(self)
+        self._exportProcess.setProcessChannelMode(QProcess.MergedChannels)
+        self._exportProcess.setWorkingDirectory(repo_dir)
+        self._exportProcess.readyReadStandardOutput.connect(
+            self._handle_export_output
+        )
+        self._exportProcess.finished.connect(self._export_finished)
+        self._pendingExportInfo = {
+            "inference_dir": inference_dir,
+            "output_dir": output_dir,
+            "checkpoint": checkpoint_prefix,
+        }
+        self._exportLogBuffer = ""
+        self._exportProcess.start(sys.executable, args)
+        if not self._exportProcess.waitForStarted(5000):
+            self._exportProcess = None
+            self._pendingExportInfo = None
+            self._show_export_failure("Unable to start export_model.py process.")
+            return
+        message = self.get_str("trainExporting")
+        if self.trainingDialog:
+            self.trainingDialog.append_text("\n" + message + "\n")
+        self.statusBar().showMessage(message, 5000)
+
+    def _handle_export_output(self):
+        if not self._exportProcess:
+            return
+        data = bytes(self._exportProcess.readAllStandardOutput()).decode(
+            errors="ignore"
+        )
+        self._exportLogBuffer += data
+        if self.trainingDialog:
+            self.trainingDialog.append_text(data)
+
+    def _export_finished(self, exitCode, _status):
+        info = self._pendingExportInfo
+        self._exportProcess = None
+        self._pendingExportInfo = None
+        log_tail = (self._exportLogBuffer or "").strip()
+        self._exportLogBuffer = ""
+        if exitCode != 0:
+            reason = log_tail or f"exit code {exitCode}"
+            self._show_export_failure(reason)
+            return
+        if not info:
+            return
+        inference_dir = info.get("inference_dir")
+        self._apply_exported_detection_model(inference_dir)
+
+    def _show_export_failure(self, reason):
+        logger.error("Auto export failed: %s", reason)
+        message = self.get_str("trainExportFailed")
+        if "{0}" in message:
+            text = message.format(reason)
+        else:
+            text = "{}\n{}".format(message, reason)
+        if self.trainingDialog:
+            self.trainingDialog.append_text("\n" + text + "\n")
+        QMessageBox.warning(self, "Warning", text)
+
+    def _show_export_success(self, directory):
+        message = self.get_str("trainExportSuccess")
+        if "{0}" in message:
+            text = message.format(directory)
+        else:
+            text = "{}\n{}".format(message, directory)
+        if self.trainingDialog:
+            self.trainingDialog.append_text("\n" + text + "\n")
+        QMessageBox.information(self, "Information", text)
+
+    def _apply_exported_detection_model(self, inference_dir):
+        if not inference_dir or not os.path.isdir(inference_dir):
+            self._show_export_failure(f"Inference directory not found: {inference_dir}")
+            return
+        valid, model_type = validate_model_dir(inference_dir)
+        if not valid or (model_type and model_type != "det"):
+            self._show_export_failure(
+                f"Exported directory does not look like a detection model: {inference_dir}"
+            )
+            return
+        prev_det = self.det_model_dir
+        try:
+            self.det_model_dir = inference_dir
+            self.settings[SETTING_DET_MODEL_PATH] = inference_dir
+            extra_dir = self.settings.get(SETTING_MODEL_SEARCH_DIR)
+            parent_dir = os.path.dirname(inference_dir)
+            if not extra_dir:
+                self.settings[SETTING_MODEL_SEARCH_DIR] = parent_dir
+            self.settings.save()
+            self._reload_ocr_backends()
+            self._show_export_success(inference_dir)
+        except Exception as exc:
+            logger.exception("Failed to apply exported detection model: %s", exc)
+            self.det_model_dir = prev_det
+            self._show_export_failure(str(exc))
+
+    def _find_latest_checkpoint(self, output_dir):
+        if not output_dir or not os.path.isdir(output_dir):
+            return None
+        preferred = ["best_accuracy", "best_model", "latest"]
+        for name in preferred:
+            candidate = os.path.join(output_dir, f"{name}.pdparams")
+            if os.path.exists(candidate):
+                return os.path.join(output_dir, name)
+        mtimes = {}
+        try:
+            entries = os.listdir(output_dir)
+        except OSError:
+            return None
+        for entry in entries:
+            lower = entry.lower()
+            if lower.endswith(".pdparams") or lower.endswith(".pdiparams"):
+                prefix, _ = os.path.splitext(entry)
+                full_path = os.path.join(output_dir, entry)
+                try:
+                    mtime = os.path.getmtime(full_path)
+                except OSError:
+                    continue
+                mtimes[prefix] = max(mtimes.get(prefix, 0), mtime)
+        if not mtimes:
+            return None
+        latest_prefix = max(mtimes.items(), key=lambda item: item[1])[0]
+        return os.path.join(output_dir, latest_prefix)
+
+    def _next_inference_dir(self, output_dir):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(output_dir, f"inference_{timestamp}")
+        candidate = base
+        suffix = 1
+        while os.path.exists(candidate):
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
 
     def _prepare_dataset_from_current(self, source_dir, ratio="8:2:0"):
         split_root = tempfile.mkdtemp(prefix="ppocrlabel_split_")
@@ -3551,6 +3751,15 @@ class MainWindow(QMainWindow):
 
     def _read_inference_meta(self, directory):
         return read_inference_meta(directory)
+
+    def _infer_model_name(self, directory, default_name):
+        if not directory:
+            return default_name
+        info = self._read_inference_meta(directory) or {}
+        name = info.get("model_name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return default_name
 
     def reRecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)

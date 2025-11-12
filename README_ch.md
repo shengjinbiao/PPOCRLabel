@@ -15,6 +15,8 @@ PPOCRLabelv3是一款适用于OCR领域的半自动化图形标注工具，内�
 | <img src="./data/gif/multi-point.gif" width="80%"/> |  <img src="./data/gif/kie.gif" width="100%"/>  |
 
 #### 近期更新
+- 2025.11:
+  - 通过菜单启动的训练任务结束后会自动定位最新 checkpoint，运行 `tools/export_model.py` 将推理模型导出到当前输出目录的 `inference_时间戳` 子目录，自动写入自定义检测模型配置并立即重载 PaddleOCR/PP-Structure，新模型无需手动切换即可生效。
 - 2025.06:
   - 新增`重新排序坐标框位置`功能，使用方法详见下方`2.1 操作步骤`的`11. 补充功能说明`。
 - 2024.11:
