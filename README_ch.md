@@ -7,7 +7,7 @@
 [![Downloads](https://static.pepy.tech/badge/PPOCRLabel)](https://github.com/PFCCLab/PPOCRLabel)
 
 PPOCRLabelv3��һ��������OCR����İ��Զ���ͼ�α�ע���ߣ�����PP-OCRģ�Ͷ������Զ���ע������ʶ��ʹ��Python3��PyQT5��д��֧�־��ο��ע������ע���������ı���ע���ؼ���Ϣ��עģʽ��������ʽ��ֱ������PaddleOCR����ʶ��ģ�͵�ѵ����
-
+ 
 |                      �����ע                       |                    ����ע                    |
 | :-------------------------------------------------: | :--------------------------------------------: |
 |  <img src="./data/gif/steps_en.gif" width="80%"/>   | <img src="./data/gif/table.gif" width="100%"/> |

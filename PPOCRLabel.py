@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+from pathlib import Path
 from functools import partial
 
 import openpyxl
@@ -116,6 +117,13 @@ from libs.constants import (
     SETTING_MODEL_SEARCH_DIR,
     SETTING_TRAIN_AUTO_EXPORT,
     SETTING_READING_ORDER,
+)
+from libs.model_selector import (
+    ModelSelectDialog,
+    discover_model_entries,
+    resolve_model_dir,
+    validate_model_dir,
+    read_inference_meta,
 )
 from libs.utils import (
     addActions,
@@ -832,6 +840,13 @@ class MainWindow(QMainWindow):
             "next",
             get_str("startTrainingDetail"),
         )
+        customModelAction = action(
+            get_str("customModelAction"),
+            self.chooseCustomModels,
+            "",
+            "next",
+            get_str("customModelActionDetail"),
+        )
 
         reRec = action(
             get_str("reRecognition"),
@@ -1106,6 +1121,7 @@ class MainWindow(QMainWindow):
             reRec=reRec,
             cellreRec=cellreRec,
             train=trainAction,
+            customModel=customModelAction,
             createMode=createMode,
             editMode=editMode,
             shapeLineColor=shapeLineColor,
@@ -1290,6 +1306,7 @@ class MainWindow(QMainWindow):
                 reRec,
                 cellreRec,
                 trainAction,
+                customModelAction,
                 self.readingModeMenu,
                 self.textLayoutMenu,
                 alcm,
@@ -3480,6 +3497,60 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             self.get_str("readingOrderChanged").format(label), 3000
         )
+
+    def chooseCustomModels(self):
+        official_dir = self._get_official_model_dir()
+        extra_dir = self.settings.get(SETTING_MODEL_SEARCH_DIR, official_dir)
+        entries = discover_model_entries(official_dir, extra_dir)
+        dialog = ModelSelectDialog(
+            self,
+            self.get_str,
+            official_dir,
+            extra_dir,
+            entries,
+            self.det_model_dir,
+            self.rec_model_dir,
+        )
+        if not dialog.exec_():
+            return
+        det_path, rec_path, new_extra_dir = dialog.selected_paths()
+        changed = False
+        if (new_extra_dir or "") != (extra_dir or ""):
+            self.settings[SETTING_MODEL_SEARCH_DIR] = new_extra_dir or ""
+            changed = True
+        new_det = det_path or None
+        new_rec = rec_path or None
+        if new_det != self.det_model_dir or new_rec != self.rec_model_dir:
+            old_det = self.det_model_dir
+            old_rec = self.rec_model_dir
+            try:
+                self.det_model_dir = new_det
+                self.rec_model_dir = new_rec
+                self._reload_ocr_backends()
+                self.settings[SETTING_DET_MODEL_PATH] = new_det or ""
+                self.settings[SETTING_REC_MODEL_PATH] = new_rec or ""
+                changed = True
+            except Exception as exc:
+                logger.error("Failed to load custom model: %s", exc)
+                self.det_model_dir = old_det
+                self.rec_model_dir = old_rec
+                QMessageBox.warning(
+                    self, "Warning", self.get_str("customModelInvalid")
+                )
+                self._reload_ocr_backends()
+                changed = False
+        if changed:
+            self.settings.save()
+            QMessageBox.information(
+                self, "Information", self.get_str("customModelApplied")
+            )
+
+    def _get_official_model_dir(self):
+        home = Path.home()
+        return os.path.join(str(home), ".paddlex", "official_models")
+
+    def _read_inference_meta(self, directory):
+        return read_inference_meta(directory)
 
     def reRecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
