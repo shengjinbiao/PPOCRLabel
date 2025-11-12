@@ -30,3 +30,13 @@ python tools/train.py -c configs/det/PP-OCRv4/PP-OCRv4_mobile_det.yml `
      Eval.dataset.data_dir="D:\hnz_dataset_split\det" `
      Eval.dataset.label_file_list=["D:/hnz_dataset_split/det/test.txt"]
 
+python PPOCRLabel.py `  --det_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_mobile_det" `
+  --rec_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_mobile_rec"
+
+# 启动标注程序，识别竖排中文文本，使用 GPU，并指定检测和识别模型路径
+  (ppocrlabel) PS D:\PPOCRLabel> python PPOCRLabel.py `
+>>   --lang ch `
+>>   --text_layout vertical `
+>>   --gpu true `
+>>   --det_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_mobile_det" `
+>>   --rec_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_mobile_rec"

@@ -111,6 +111,11 @@ from libs.constants import (
     SETTING_TRAIN_CONFIG_PATH,
     SETTING_TRAIN_BATCH_SIZE,
     SETTING_TRAIN_EPOCHS,
+    SETTING_DET_MODEL_PATH,
+    SETTING_REC_MODEL_PATH,
+    SETTING_MODEL_SEARCH_DIR,
+    SETTING_TRAIN_AUTO_EXPORT,
+    SETTING_READING_ORDER,
 )
 from libs.utils import (
     addActions,
@@ -259,6 +264,11 @@ class MainWindow(QMainWindow):
             self.text_layout_mode = "horizontal"
         self.use_vertical_text = self.text_layout_mode == "vertical"
         self.settings[SETTING_TEXT_LAYOUT_MODE] = self.text_layout_mode
+        stored_reading_order = settings.get(SETTING_READING_ORDER, "horizontal")
+        if stored_reading_order not in ("horizontal", "vertical"):
+            stored_reading_order = "horizontal"
+        self.reading_mode = stored_reading_order
+        self.settings[SETTING_READING_ORDER] = self.reading_mode
 
         self._reload_ocr_backends()
         self.text_recognizer = TextRecognition(
@@ -1051,6 +1061,31 @@ class MainWindow(QMainWindow):
         self.textLayoutMenu.addAction(layout_horizontal)
         self.textLayoutMenu.addAction(layout_vertical)
         self.textLayoutMenu.setStatusTip(get_str("textLayoutMenuDetail"))
+        reading_horizontal = action(
+            get_str("readingOrderHorizontal"),
+            lambda: self.changeReadingOrder("horizontal"),
+            checkable=True,
+        )
+        reading_vertical = action(
+            get_str("readingOrderVertical"),
+            lambda: self.changeReadingOrder("vertical"),
+            checkable=True,
+        )
+        self.readingModeActionGroup = QActionGroup(self)
+        self.readingModeActionGroup.setExclusive(True)
+        self.readingModeActionGroup.addAction(reading_horizontal)
+        self.readingModeActionGroup.addAction(reading_vertical)
+        if self.reading_mode == "vertical":
+            reading_vertical.setChecked(True)
+        else:
+            reading_horizontal.setChecked(True)
+        self.readingModeMenu = QMenu(get_str("readingOrder"), self)
+        self.readingModeMenu.addAction(reading_horizontal)
+        self.readingModeMenu.addAction(reading_vertical)
+        self.readingModeActions = {
+            "horizontal": reading_horizontal,
+            "vertical": reading_vertical,
+        }
 
         # Store actions for further handling.
         self.actions = struct(
@@ -1255,6 +1290,7 @@ class MainWindow(QMainWindow):
                 reRec,
                 cellreRec,
                 trainAction,
+                self.readingModeMenu,
                 self.textLayoutMenu,
                 alcm,
                 None,
@@ -3424,6 +3460,27 @@ class MainWindow(QMainWindow):
             3000,
         )
 
+    def changeReadingOrder(self, mode):
+        if mode not in ("horizontal", "vertical"):
+            return
+        if mode == self.reading_mode:
+            return
+        self.reading_mode = mode
+        self.settings[SETTING_READING_ORDER] = self.reading_mode
+        self.settings.save()
+        if hasattr(self, "readingModeActions"):
+            action = self.readingModeActions.get(mode)
+            if action:
+                action.setChecked(True)
+        label = (
+            self.get_str("readingOrderVertical")
+            if mode == "vertical"
+            else self.get_str("readingOrderHorizontal")
+        )
+        self.statusBar().showMessage(
+            self.get_str("readingOrderChanged").format(label), 3000
+        )
+
     def reRecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         if self.canvas.shapes:
@@ -4133,36 +4190,76 @@ class MainWindow(QMainWindow):
     def sort_rectangles(self, rectangles, row_height_threshold=0.5):
         if not rectangles:
             return []
-
-        def get_top_left(rect):
-            xs = [p[0] for p in rect]
-            ys = [p[1] for p in rect]
-            return (min(xs), min(ys))
-
-        avg_height = sum(
-            [max(p[1] for p in rect) - min(p[1] for p in rect) for rect in rectangles]
-        ) / len(rectangles)
-        threshold = avg_height * row_height_threshold
-        indexed_rects = [(i, get_top_left(rect)) for i, rect in enumerate(rectangles)]
-        indexed_rects.sort(key=lambda x: x[1][1])
-        rows = []
-        current_row = []
-        last_y = indexed_rects[0][1][1]
-        for item in indexed_rects:
-            i, (x, y) = item
-            if abs(y - last_y) <= threshold:
-                current_row.append(item)
-            else:
+        rect_info = []
+        for idx, rect in enumerate(rectangles):
+            xs = [pt[0] for pt in rect]
+            ys = [pt[1] for pt in rect]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            rect_info.append(
+                {
+                    "index": idx,
+                    "center_x": (min_x + max_x) / 2.0,
+                    "center_y": (min_y + max_y) / 2.0,
+                    "width": max_x - min_x,
+                    "height": max_y - min_y,
+                }
+            )
+        if not rect_info:
+            return rectangles
+        mode = getattr(self, "reading_mode", "horizontal")
+        if mode == "vertical":
+            avg_width = (
+                sum(info["width"] for info in rect_info) / len(rect_info)
+                if rect_info
+                else 1.0
+            )
+            threshold = avg_width * row_height_threshold if avg_width > 0 else 10.0
+            sorted_by_x = sorted(
+                rect_info, key=lambda info: info["center_x"], reverse=True
+            )
+            columns = []
+            current_col = [sorted_by_x[0]]
+            last_x = sorted_by_x[0]["center_x"]
+            for info in sorted_by_x[1:]:
+                if abs(info["center_x"] - last_x) <= threshold:
+                    current_col.append(info)
+                else:
+                    columns.append(current_col)
+                    current_col = [info]
+                last_x = info["center_x"]
+            if current_col:
+                columns.append(current_col)
+            ordered = []
+            for col in columns:
+                col.sort(key=lambda info: info["center_y"])
+                ordered.extend(rectangles[info["index"]] for info in col)
+            return ordered
+        else:
+            avg_height = (
+                sum(info["height"] for info in rect_info) / len(rect_info)
+                if rect_info
+                else 1.0
+            )
+            threshold = avg_height * row_height_threshold if avg_height > 0 else 10.0
+            sorted_by_y = sorted(rect_info, key=lambda info: info["center_y"])
+            rows = []
+            current_row = [sorted_by_y[0]]
+            last_y = sorted_by_y[0]["center_y"]
+            for info in sorted_by_y[1:]:
+                if abs(info["center_y"] - last_y) <= threshold:
+                    current_row.append(info)
+                else:
+                    rows.append(current_row)
+                    current_row = [info]
+                last_y = info["center_y"]
+            if current_row:
                 rows.append(current_row)
-                current_row = [item]
-            last_y = y
-        if current_row:
-            rows.append(current_row)
-        sorted_rects = []
-        for row in rows:
-            row.sort(key=lambda x: x[1][0])
-            sorted_rects.extend([rectangles[i] for i, _ in row])
-        return sorted_rects
+            ordered = []
+            for row in rows:
+                row.sort(key=lambda info: info["center_x"])
+                ordered.extend(rectangles[info["index"]] for info in row)
+            return ordered
 
     def resortBoxPosition(self):
         # get original elements
@@ -4204,7 +4301,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Information",
-            "resort success!",
+            self.get_str("resortSuccess"),
         )
 
 
