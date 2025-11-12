@@ -49,3 +49,9 @@ conda activate ppocrlabel
 python .\PPOCRLabel.py `
   --det_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_server_det" `
   --rec_model_dir "C:\Users\sheng\.paddlex\official_models\PP-OCRv5_server_rec"
+
+从上一次的checkpoint继续训练:
+
+python tools/train.py -c your_config.yml -o Global.use_gpu=True \
+    Global.save_model_dir=... \
+    Global.checkpoints="D:/hnz_models/det_db/latest"
