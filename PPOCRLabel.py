@@ -319,7 +319,7 @@ class MainWindow(QMainWindow):
         if self.rec_model_dir:
             rec_kwargs["model_dir"] = self.rec_model_dir
         self.text_recognizer = TextRecognition(**rec_kwargs)
-        enable_candidate_extraction(self.text_recognizer, top_k=6)
+        enable_candidate_extraction(self.text_recognizer, top_k=10)
 
         det_kwargs = {
             "device": self.gpu,
@@ -496,6 +496,8 @@ class MainWindow(QMainWindow):
             self.labelList,
             lambda item: self.itemsToShapes.get(item),
             candidate_loader=self._ensure_shape_candidates,
+            low_threshold=self.low_confidence_threshold,
+            low_color=self._low_confidence_brush.color(),
             parent=self,
         )
         self._apply_result_font_size(self.result_font_size)
@@ -2121,10 +2123,19 @@ class MainWindow(QMainWindow):
         if not item:
             return
         score = getattr(shape, "rec_score", 1.0)
-        if score < self.low_confidence_threshold:
-            item.setForeground(self._low_confidence_brush)
-        else:
+        sequence = getattr(shape, "char_candidates", None)
+        has_char_scores = (
+            isinstance(sequence, list)
+            and len(sequence) == len(shape.label or "")
+            and all(isinstance(entry, dict) for entry in sequence)
+        )
+        if has_char_scores:
             item.setForeground(self._default_label_brush)
+        else:
+            if score < self.low_confidence_threshold:
+                item.setForeground(self._low_confidence_brush)
+            else:
+                item.setForeground(self._default_label_brush)
         if isinstance(score, (int, float)):
             item.setToolTip(f"Confidence: {score:.2f}")
 
@@ -2152,15 +2163,22 @@ class MainWindow(QMainWindow):
                 if shape.line_color != DEFAULT_LOCK_COLOR
             ]
         # Can add different annotation formats here
-        for box in self.result_dic:
-            trans_dic = {"label": box[1][0], "points": box[0], "difficult": False}
+        for res in self.result_dic:
+            trans_dic = {"label": res[1][0], "points": res[0], "difficult": False}
             if self.kie_mode:
-                if len(box) == 3:
-                    trans_dic.update({"key_cls": box[2]})
+                if len(res) == 3:
+                    trans_dic.update({"key_cls": res[2]})
                 else:
                     trans_dic.update({"key_cls": "None"})
             if trans_dic["label"] == "" and mode == "Auto":
                 continue
+            score_val = 0.0
+            try:
+                score_val = float(res[1][1])
+            except Exception:
+                score_val = 0.0
+            key = self._candidate_key_from_box(trans_dic["points"])
+            self._score_cache[key] = score_val
             shapes.append(trans_dic)
 
         try:
@@ -3950,9 +3968,9 @@ class MainWindow(QMainWindow):
                         "Can not recognise the detection box in "
                         + self.filePath
                         + ". Please change manually"
-                )
-                QMessageBox.information(self, "Information", msg)
-                return
+                    )
+                    QMessageBox.information(self, "Information", msg)
+                    return
                 result = self.text_recognizer.predict(img_crop)[0]
                 shape.char_candidates = result.get("char_candidates", []) or []
                 self._store_shape_candidates(shape, box, shape.char_candidates)

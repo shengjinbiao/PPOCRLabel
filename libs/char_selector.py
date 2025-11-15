@@ -3,8 +3,8 @@ import types
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PyQt5.QtCore import QObject, QPoint, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import QObject, QPoint, QPointF, Qt
+from PyQt5.QtGui import QColor, QFont, QPen
 from PyQt5.QtWidgets import (
     QAction,
     QLineEdit,
@@ -12,6 +12,8 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QStyledItemDelegate,
+    QStyle,
+    QStyleOptionViewItem,
 )
 
 try:
@@ -135,6 +137,10 @@ def _build_candidate_sequences(
     ignored = set(ignored_tokens)
     sequences: List[List[dict]] = []
 
+    char_index_lookup = {}
+    for idx, char in enumerate(character_list):
+        char_index_lookup.setdefault(char, idx)
+
     for sample_idx, (text, meta) in enumerate(zip(texts, metadata)):
         if not isinstance(text, str) or not text or meta is None:
             sequences.append([])
@@ -175,11 +181,15 @@ def _build_candidate_sequences(
                 options.append({"char": char, "score": float(probs[cls])})
                 if len(options) >= top_k:
                     break
+            char_class = flat_chars[idx]
+            char_idx = char_index_lookup.get(char_class)
+            char_score = float(probs[char_idx]) if char_idx is not None else 0.0
             char_entries.append(
                 {
-                    "char": flat_chars[idx],
+                    "char": char_class,
                     "position": int(column),
                     "candidates": options,
+                    "score": char_score,
                 }
             )
         sequences.append(char_entries)
@@ -203,6 +213,7 @@ class CandidatePopup(QMenu):
         self.clear()
         self._current_editor = editor
         self._char_index = char_index
+        base_font = editor.font()
 
         for opt in options:
             char = opt.get("char", "")
@@ -213,11 +224,11 @@ class CandidatePopup(QMenu):
             if isinstance(score, (float, int)):
                 title = f"{char}  ({score:.2f})"
             action = QAction(title, self)
+            action_font = QFont(base_font)
             action.setData(char)
             if char == current_char:
-                font = QFont(action.font())
-                font.setBold(True)
-                action.setFont(font)
+                action_font.setBold(True)
+            action.setFont(action_font)
             self.addAction(action)
 
         if not self.actions():
@@ -283,6 +294,52 @@ class CandidateDelegate(QStyledItemDelegate):
     def setModelData(self, editor, model, index):
         model.setData(index, editor.text(), Qt.EditRole)
 
+    def paint(self, painter, option, index):
+        item = self._controller.list_widget.item(index.row())
+        text = index.model().data(index, Qt.DisplayRole)
+        if not isinstance(text, str) or not text:
+            super().paint(painter, option, index)
+            return
+        entries = self._controller.entries_for_paint(item, text)
+        if not entries:
+            super().paint(painter, option, index)
+            return
+
+        painter.save()
+        painter.setClipRect(option.rect)
+        selected = bool(option.state & QStyle.State_Selected)
+        if selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+        normal_color = (
+            option.palette.highlightedText().color()
+            if selected
+            else option.palette.text().color()
+        )
+        normal_pen = QPen(normal_color)
+        low_color = self._controller.low_color
+        low_pen = QPen(low_color)
+        metrics = option.fontMetrics
+        x = option.rect.x() + 4
+        baseline = option.rect.y() + (
+            option.rect.height() + metrics.ascent() - metrics.descent()
+        ) / 2
+
+        for idx, ch in enumerate(text):
+            advance = metrics.horizontalAdvance(ch)
+            entry_score = (
+                entries[idx].get("score", 1.0) if idx < len(entries) else 1.0
+            )
+            pen = low_pen if entry_score < self._controller.low_conf_threshold else normal_pen
+            painter.setPen(pen)
+            painter.drawText(QPointF(x, baseline), ch)
+            x += advance
+
+        painter.restore()
+        if option.state & QStyle.State_HasFocus:
+            opt = QStyleOptionViewItem(option)
+            view = self._controller.list_widget
+            view.style().drawPrimitive(QStyle.PE_FrameFocusRect, opt, painter, view)
+
 
 class CharacterCandidateController(QObject):
     """
@@ -294,12 +351,16 @@ class CharacterCandidateController(QObject):
         list_widget: QListWidget,
         resolve_shape: Callable[[Optional[QListWidgetItem]], object],
         candidate_loader: Optional[Callable[[object], bool]] = None,
+        low_threshold: float = 0.85,
+        low_color: Optional[QColor] = None,
         parent=None,
     ):
         super().__init__(parent or list_widget)
         self.list_widget = list_widget
         self._resolve_shape = resolve_shape
         self._candidate_loader = candidate_loader
+        self.low_conf_threshold = low_threshold
+        self.low_color = QColor(low_color) if low_color else QColor("#c62828")
         self._popup = CandidatePopup(list_widget)
         self._delegate = CandidateDelegate(self)
         self.list_widget.setItemDelegate(self._delegate)
@@ -346,3 +407,14 @@ class CharacterCandidateController(QObject):
 
         editor.setCursorPosition(cursor_index)
         self._popup.show_options(editor, cursor_index, filtered, current_char)
+
+    def entries_for_paint(self, item: Optional[QListWidgetItem], text: str):
+        if item is None or not text:
+            return None
+        shape = self._resolve_shape(item)
+        if shape is None:
+            return None
+        sequence = getattr(shape, "char_candidates", None)
+        if not sequence or len(sequence) != len(text):
+            return None
+        return sequence
