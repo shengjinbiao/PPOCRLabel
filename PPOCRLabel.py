@@ -118,6 +118,8 @@ from libs.constants import (
     SETTING_MODEL_SEARCH_DIR,
     SETTING_TRAIN_AUTO_EXPORT,
     SETTING_READING_ORDER,
+    SETTING_RESULT_FONT_SIZE,
+    SETTING_DET_PANEL_VISIBLE,
 )
 from libs.model_selector import (
     ModelSelectDialog,
@@ -237,6 +239,23 @@ class MainWindow(QMainWindow):
         self.settings = Settings()
         self.settings.load()
         settings = self.settings
+        stored_font_size = settings.get(SETTING_RESULT_FONT_SIZE, 18)
+        try:
+            stored_font_size = int(stored_font_size)
+        except (TypeError, ValueError):
+            stored_font_size = 18
+        self.result_font_size = max(8, min(48, stored_font_size))
+        stored_box_panel_visibility = settings.get(SETTING_DET_PANEL_VISIBLE, False)
+        if isinstance(stored_box_panel_visibility, str):
+            stored_box_panel_visibility = stored_box_panel_visibility.lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        else:
+            stored_box_panel_visibility = bool(stored_box_panel_visibility)
+        self.box_panel_visible = stored_box_panel_visibility
         auto_export = settings.get(SETTING_TRAIN_AUTO_EXPORT)
         if auto_export is None:
             auto_export = True
@@ -460,6 +479,7 @@ class MainWindow(QMainWindow):
 
         # Create and add a widget for showing current label items
         self.labelList = EditInList()
+        self._apply_result_font_size(self.result_font_size)
         labelListContainer = QWidget()
         labelListContainer.setLayout(listLayout)
         self.labelList.itemSelectionChanged.connect(self.labelSelectionChanged)
@@ -489,6 +509,16 @@ class MainWindow(QMainWindow):
         # Trigger drop event
         self.labelList.model().rowsMoved.connect(self.drag_drop_happened)
 
+        fontControlLayout = QHBoxLayout()
+        fontControlLayout.addWidget(QLabel(get_str("resultFontSizeLabel")))
+        self.resultFontSizeSpin = QSpinBox()
+        self.resultFontSizeSpin.setRange(8, 48)
+        self.resultFontSizeSpin.setValue(self.result_font_size)
+        self.resultFontSizeSpin.valueChanged.connect(self._on_result_font_size_changed)
+        fontControlLayout.addWidget(self.resultFontSizeSpin)
+        fontControlLayout.addStretch(1)
+        listLayout.addLayout(fontControlLayout)
+
         labelIndexListContainer = QWidget()
         labelIndexListContainer.setLayout(labelIndexListlBox)
         listLayout.addWidget(labelIndexListContainer)
@@ -512,6 +542,7 @@ class MainWindow(QMainWindow):
         self.BoxListDock = QDockWidget(self.BoxListDockName, self)
         self.BoxListDock.setWidget(self.BoxList)
         self.BoxListDock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.BoxListDock.setVisible(self.box_panel_visible)
         listLayout.addWidget(self.BoxListDock)
 
         #  ================== Lower Right Area  ==================
@@ -519,9 +550,14 @@ class MainWindow(QMainWindow):
         leftbtmtoolbox.addWidget(self.SaveButton)
         leftbtmtoolbox.addWidget(self.DelButton)
         leftbtmtoolbox.addWidget(self.ResortButton)
+        self.toggleBoxPanelButton = QToolButton()
+        self.toggleBoxPanelButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggleBoxPanelButton.clicked.connect(self.toggle_box_panel_visibility)
+        leftbtmtoolbox.addWidget(self.toggleBoxPanelButton)
         leftbtmtoolboxcontainer = QWidget()
         leftbtmtoolboxcontainer.setLayout(leftbtmtoolbox)
         listLayout.addWidget(leftbtmtoolboxcontainer)
+        self._update_box_panel_button_text()
 
         self.dock = QDockWidget(get_str("boxLabelText"), self)
         self.dock.setObjectName(get_str("labels"))
@@ -2067,6 +2103,40 @@ class MainWindow(QMainWindow):
     def move_scrollbar(self, value):
         self.labelListBar.setValue(int(value))
         self.indexListBar.setValue(int(value))
+
+    def _apply_result_font_size(self, size):
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            size = self.result_font_size
+        size = max(8, min(48, size))
+        self.result_font_size = size
+        style = (
+            f"QListWidget {{ font-size: {size}px; }} "
+            f"QListWidget::item {{ font-size: {size}px; }}"
+        )
+        if hasattr(self, "labelList"):
+            self.labelList.setStyleSheet(style)
+        if hasattr(self, "indexList"):
+            self.indexList.setStyleSheet(style)
+
+    def _on_result_font_size_changed(self, value):
+        self._apply_result_font_size(value)
+        self.settings[SETTING_RESULT_FONT_SIZE] = self.result_font_size
+
+    def toggle_box_panel_visibility(self):
+        new_visibility = not self.BoxListDock.isVisible()
+        self.BoxListDock.setVisible(new_visibility)
+        self.settings[SETTING_DET_PANEL_VISIBLE] = new_visibility
+        self._update_box_panel_button_text()
+
+    def _update_box_panel_button_text(self):
+        if not hasattr(self, "toggleBoxPanelButton"):
+            return
+        text_id = "showDetectionPanel"
+        if self.BoxListDock.isVisible():
+            text_id = "hideDetectionPanel"
+        self.toggleBoxPanelButton.setText(self.get_str(text_id))
 
     def labelSelectionChanged(self):
         if self._noSelectionSlot:
