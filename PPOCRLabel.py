@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import copy
 from pathlib import Path
 from functools import partial
 
@@ -51,6 +52,7 @@ from PyQt5.QtGui import (
     QIcon,
     QFontDatabase,
     QTextCursor,
+    QBrush,
 )
 from PyQt5.QtWidgets import (
     QMainWindow,
@@ -159,6 +161,10 @@ from libs.hashableQListWidgetItem import HashableQListWidgetItem
 from libs.editinlist import EditInList
 from libs.unique_label_qlist_widget import UniqueLabelQListWidget
 from libs.keyDialog import KeyDialog
+from libs.char_selector import (
+    CharacterCandidateController,
+    enable_candidate_extraction,
+)
 
 import logging
 
@@ -313,6 +319,7 @@ class MainWindow(QMainWindow):
         if self.rec_model_dir:
             rec_kwargs["model_dir"] = self.rec_model_dir
         self.text_recognizer = TextRecognition(**rec_kwargs)
+        enable_candidate_extraction(self.text_recognizer, top_k=6)
 
         det_kwargs = {
             "device": self.gpu,
@@ -336,6 +343,9 @@ class MainWindow(QMainWindow):
         self.lastOpenDir = None
         self.result_dic = []
         self.result_dic_locked = []
+        self._candidate_cache = {}
+        self._score_cache = {}
+        self._cache_owner = None
         self.changeFileFolder = False
         self.haveAutoReced = False
         self.trainingProcess = None
@@ -372,6 +382,9 @@ class MainWindow(QMainWindow):
         self.model = "paddle"
         self.PPreader = None
         self.autoSaveNum = 5
+        self.low_confidence_threshold = 0.85
+        self._low_confidence_brush = QBrush(QColor("#c62828"))
+        self._default_label_brush = QBrush(QColor("#000000"))
 
         #  ================== File List  ==================
 
@@ -479,6 +492,12 @@ class MainWindow(QMainWindow):
 
         # Create and add a widget for showing current label items
         self.labelList = EditInList()
+        self.charCandidateController = CharacterCandidateController(
+            self.labelList,
+            lambda item: self.itemsToShapes.get(item),
+            candidate_loader=self._ensure_shape_candidates,
+            parent=self,
+        )
         self._apply_result_font_size(self.result_font_size)
         labelListContainer = QWidget()
         labelListContainer.setLayout(listLayout)
@@ -1932,6 +1951,7 @@ class MainWindow(QMainWindow):
         current_index.setTextAlignment(Qt.AlignHCenter)
         self.indexList.addItem(current_index)
         self.labelList.addItem(item)
+        self._update_label_item_style(shape)
         # print('item in add label is ',[(p.x(), p.y()) for p in shape.points], shape.label)
 
         # ADD for box
@@ -1958,6 +1978,9 @@ class MainWindow(QMainWindow):
             # print('rm empty label')
             return
         for shape in shapes:
+            key = self._candidate_key_from_shape(shape)
+            self._candidate_cache.pop(key, None)
+            self._score_cache.pop(key, None)
             item = self.shapesToItems[shape]
             self.labelList.takeItem(self.labelList.row(item))
             del self.shapesToItems[shape]
@@ -1996,6 +2019,7 @@ class MainWindow(QMainWindow):
             shape.close()
             s.append(shape)
 
+            self._restore_shape_candidates(shape)
             self._update_shape_color(shape)
             self.addLabel(shape)
 
@@ -2008,6 +2032,7 @@ class MainWindow(QMainWindow):
             return
         item = self.shapesToItems[shape]
         item.setText(shape.label)
+        self._update_label_item_style(shape)
         self.updateComboBox()
 
         # ADD:
@@ -2034,6 +2059,74 @@ class MainWindow(QMainWindow):
             string = QListWidgetItem(str(i))
             string.setTextAlignment(Qt.AlignHCenter)
             self.indexList.addItem(string)
+
+    def _candidate_key_from_box(self, box_points):
+        return tuple((int(pt[0]), int(pt[1])) for pt in box_points)
+
+    def _candidate_key_from_shape(self, shape):
+        return tuple((int(p.x()), int(p.y())) for p in shape.points)
+
+    def _store_shape_candidates(self, shape, box, candidates):
+        key = self._candidate_key_from_box(box)
+        if candidates:
+            self._candidate_cache[key] = copy.deepcopy(candidates)
+        else:
+            self._candidate_cache.pop(key, None)
+
+    def _restore_shape_candidates(self, shape):
+        key = self._candidate_key_from_shape(shape)
+        cached = self._candidate_cache.get(key)
+        if cached:
+            shape.char_candidates = copy.deepcopy(cached)
+        else:
+            shape.char_candidates = getattr(shape, "char_candidates", [])
+        self._restore_shape_confidence(shape)
+
+    def _store_shape_confidence(self, shape, box):
+        score = float(getattr(shape, "rec_score", 1.0) or 0.0)
+        key = self._candidate_key_from_box(box)
+        self._score_cache[key] = score
+
+    def _restore_shape_confidence(self, shape):
+        key = self._candidate_key_from_shape(shape)
+        if key in self._score_cache:
+            shape.rec_score = self._score_cache[key]
+
+    def _ensure_shape_candidates(self, shape):
+        if getattr(shape, "char_candidates", None):
+            return True
+        if not self.filePath or not os.path.exists(self.filePath):
+            return False
+        img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return False
+        box = [[int(p.x()), int(p.y())] for p in shape.points]
+        if len(box) > 4:
+            box = self.gen_quad_from_poly(np.array(box))
+        if len(box) != 4:
+            return False
+        img_crop = get_rotate_crop_image(img, np.array(box, np.float32))
+        if img_crop is None:
+            return False
+        result = self.text_recognizer.predict(img_crop)[0]
+        candidates = result.get("char_candidates")
+        if not candidates:
+            return False
+        shape.char_candidates = candidates
+        self._store_shape_candidates(shape, box, candidates)
+        return True
+
+    def _update_label_item_style(self, shape):
+        item = self.shapesToItems.get(shape)
+        if not item:
+            return
+        score = getattr(shape, "rec_score", 1.0)
+        if score < self.low_confidence_threshold:
+            item.setForeground(self._low_confidence_brush)
+        else:
+            item.setForeground(self._default_label_brush)
+        if isinstance(score, (int, float)):
+            item.setToolTip(f"Confidence: {score:.2f}")
 
     def saveLabels(self, annotationFilePath, mode="Auto"):
         # Mode is Auto means that labels will be loaded from self.result_dic totally, which is the output of ocr model
@@ -2461,6 +2554,10 @@ class MainWindow(QMainWindow):
             self.status("Loaded %s" % os.path.basename(unicodeFilePath))
             self.image = image
             self.filePath = unicodeFilePath
+            if self._cache_owner != unicodeFilePath:
+                self._candidate_cache.clear()
+                self._score_cache.clear()
+                self._cache_owner = unicodeFilePath
             if unicodeFilePath in self.mImgList:
                 self.currIndex = self.mImgList.index(unicodeFilePath)
             self.canvas.loadPixmap(QPixmap.fromImage(image))
@@ -3853,12 +3950,15 @@ class MainWindow(QMainWindow):
                         "Can not recognise the detection box in "
                         + self.filePath
                         + ". Please change manually"
-                    )
-                    QMessageBox.information(self, "Information", msg)
-                    return
+                )
+                QMessageBox.information(self, "Information", msg)
+                return
                 result = self.text_recognizer.predict(img_crop)[0]
+                shape.char_candidates = result.get("char_candidates", []) or []
+                self._store_shape_candidates(shape, box, shape.char_candidates)
                 storage = [(result["rec_text"], result["rec_score"])]
                 if result["rec_text"] != "":
+                    shape.rec_score = float(result.get("rec_score") or 0.0)
                     if shape.line_color == DEFAULT_LOCK_COLOR:
                         shape.label = result["rec_text"]
                         storage.insert(0, box)
@@ -3872,6 +3972,7 @@ class MainWindow(QMainWindow):
                         self.result_dic.append(storage)
                 else:
                     logger.warning("Can not recognise the box")
+                    shape.rec_score = 0.0
                     if shape.line_color == DEFAULT_LOCK_COLOR:
                         shape.label = result["rec_text"]
                         if self.kie_mode:
@@ -3887,6 +3988,9 @@ class MainWindow(QMainWindow):
                             )
                         else:
                             self.result_dic.append([box, (self.noLabelText, 0)])
+                if not shape.char_candidates:
+                    shape.char_candidates = []
+                self._store_shape_confidence(shape, box)
                 try:
                     if (
                         self.noLabelText == shape.label
@@ -3932,8 +4036,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Information", msg)
                 return
             result = self.text_recognizer.predict(img_crop)[0]
+            score = float(result.get("rec_score") or 0.0)
+            shape.char_candidates = result.get("char_candidates", []) or []
+            self._store_shape_candidates(shape, box, shape.char_candidates)
             storage = [(result["rec_text"], result["rec_score"])]
             if result["rec_text"] != "":
+                shape.rec_score = score
                 storage.insert(0, box)
                 storage.append(result["rec_text"])
                 if self.kie_mode:
@@ -3949,6 +4057,10 @@ class MainWindow(QMainWindow):
                     logger.debug("label no change")
                 else:
                     shape.label = self.noLabelText
+                shape.rec_score = 0.0
+            if not shape.char_candidates:
+                shape.char_candidates = []
+            self._store_shape_confidence(shape, box)
             self.singleLabel(shape)
             self.setDirty()
 
@@ -4147,12 +4259,15 @@ class MainWindow(QMainWindow):
                     logger.debug("label no change")
                 else:
                     shape.label = result[1][0]
+                shape.rec_score = float(probs)
             else:
                 logger.warning("Can not recognise the box")
                 if self.noLabelText == shape.label:
                     logger.debug("label no change")
                 else:
                     shape.label = self.noLabelText
+                shape.rec_score = 0.0
+            self._store_shape_confidence(shape, box)
             self.singleLabel(shape)
             self.setDirty()
 

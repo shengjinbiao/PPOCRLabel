@@ -69,6 +69,7 @@ class Shape(object):
         self.paintLabel = paintLabel
         self.paintIdx = paintIdx
         self.locked = False
+        self.rec_score = 1.0
         self.direction = 0
         self.center = None
         self.epsilon = 5  # same as canvas
@@ -79,6 +80,7 @@ class Shape(object):
             self.MOVE_VERTEX: (1.5, self.P_SQUARE),
         }
         self.fontsize = 8
+        self.char_candidates = []
 
         self._closed = False
         self.font_family = font_family

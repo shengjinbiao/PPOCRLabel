@@ -1,0 +1,400 @@
+                key_list_height = 50
+            self.keyList.setMaximumHeight(key_list_height)
+
+            self.keyListDockName = get_str("keyListTitle")
+            self.keyListDock = QDockWidget(self.keyListDockName, self)
+            self.keyListDock.setWidget(self.keyList)
+            self.keyListDock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+            filelistLayout.addWidget(self.keyListDock)
+
+        self.auto_recognition_num = 1
+
+        self.AutoRecognitionNum = QSpinBox()
+        self.AutoRecognitionNum.valueChanged.connect(self.autoRecognitionNum)
+        self.AutoRecognitionNum.setFixedWidth(80)
+
+        self.AutoRecognition = QToolButton()
+        self.AutoRecognition.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.AutoRecognition.setIcon(newIcon("Auto"))
+        autoRecLayout = QHBoxLayout()
+        autoRecLayout.setContentsMargins(0, 0, 0, 0)
+        autoRecLayout.addWidget(self.AutoRecognitionNum)
+        autoRecLayout.addWidget(self.AutoRecognition)
+        autoRecContainer = QWidget()
+        autoRecContainer.setLayout(autoRecLayout)
+        filelistLayout.addWidget(autoRecContainer)
+
+        #  ================== Right Area  ==================
+        listLayout = QVBoxLayout()
+        listLayout.setContentsMargins(0, 0, 0, 0)
+
+        # Buttons
+        self.editButton = QToolButton()
+        self.reRecogButton = QToolButton()
+        self.reRecogButton.setIcon(newIcon("reRec", 30))
+        self.reRecogButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
+        self.tableRecButton = QToolButton()
+        self.tableRecButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
+        self.newButton = QToolButton()
+        self.newButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.createpolyButton = QToolButton()
+        self.createpolyButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
+        self.SaveButton = QToolButton()
+        self.SaveButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.DelButton = QToolButton()
+        self.DelButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.ResortButton = QToolButton()
+        self.ResortButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
+        leftTopToolBox = QGridLayout()
+        leftTopToolBox.addWidget(self.newButton, 0, 0, 1, 1)
+        leftTopToolBox.addWidget(self.createpolyButton, 0, 1, 1, 1)
+        leftTopToolBox.addWidget(self.reRecogButton, 1, 0, 1, 1)
+        leftTopToolBox.addWidget(self.tableRecButton, 1, 1, 1, 1)
+
+        leftTopToolBoxContainer = QWidget()
+        leftTopToolBoxContainer.setLayout(leftTopToolBox)
+        listLayout.addWidget(leftTopToolBoxContainer)
+
+        #  ================== Label List  ==================
+        labelIndexListlBox = QHBoxLayout()
+
+        # Create and add a widget for showing current label item index
+        self.indexList = QListWidget()
+        self.indexList.setMaximumSize(30, 16777215)  # limit max width
+        self.indexList.setEditTriggers(QAbstractItemView.NoEditTriggers)  # no editable
+        self.indexList.itemSelectionChanged.connect(self.indexSelectionChanged)
+        self.indexList.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )  # no scroll Bar
+        self.indexListDock = QDockWidget("No.", self)
+        self.indexListDock.setWidget(self.indexList)
+        self.indexListDock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        labelIndexListlBox.addWidget(self.indexListDock, 1)
+        # no margin between two boxes
+        labelIndexListlBox.setSpacing(0)
+
+        # Create and add a widget for showing current label items
+        self.labelList = EditInList()
+        self._apply_result_font_size(self.result_font_size)
+        labelListContainer = QWidget()
+        labelListContainer.setLayout(listLayout)
+        self.labelList.itemSelectionChanged.connect(self.labelSelectionChanged)
+        self.labelList.clicked.connect(self.labelList.item_clicked)
+
+        # Connect to itemChanged to detect checkbox changes.
+        self.labelList.itemChanged.connect(self.labelItemChanged)
+        self.labelListDockName = get_str("recognitionResult")
+        self.labelListDock = QDockWidget(self.labelListDockName, self)
+        self.labelListDock.setWidget(self.labelList)
+        self.labelListDock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        labelIndexListlBox.addWidget(
+            self.labelListDock, 10
+        )  # label list is wider than index list
+
+        # enable labelList drag_drop to adjust bbox order
+        # Set selection mode to single selection
+        self.labelList.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Enable drag functionality
+        self.labelList.setDragEnabled(True)
+        # Set to accept drops
+        self.labelList.viewport().setAcceptDrops(True)
+        # Show drop indicator position
+        self.labelList.setDropIndicatorShown(True)
+        # Set drag-drop mode to move items, if not set, default is copy items
+        self.labelList.setDragDropMode(QAbstractItemView.InternalMove)
+        # Trigger drop event
+        self.labelList.model().rowsMoved.connect(self.drag_drop_happened)
+
+        fontControlLayout = QHBoxLayout()
+        fontControlLayout.addWidget(QLabel(get_str("resultFontSizeLabel")))
+        self.resultFontSizeSpin = QSpinBox()
+        self.resultFontSizeSpin.setRange(8, 48)
+        self.resultFontSizeSpin.setValue(self.result_font_size)
+        self.resultFontSizeSpin.valueChanged.connect(self._on_result_font_size_changed)
+        fontControlLayout.addWidget(self.resultFontSizeSpin)
+        fontControlLayout.addStretch(1)
+        listLayout.addLayout(fontControlLayout)
+
+        labelIndexListContainer = QWidget()
+        labelIndexListContainer.setLayout(labelIndexListlBox)
+        listLayout.addWidget(labelIndexListContainer)
+
+        # Synchronize scrolling between labelList and indexList
+        self.labelListBar = self.labelList.verticalScrollBar()
+        self.indexListBar = self.indexList.verticalScrollBar()
+
+        self.labelListBar.valueChanged.connect(self.move_scrollbar)
+        self.indexListBar.valueChanged.connect(self.move_scrollbar)
+
+        #  ================== Detection Box  ==================
+        self.BoxList = QListWidget()
+
+        # self.BoxList.itemActivated.connect(self.boxSelectionChanged)
+        self.BoxList.itemSelectionChanged.connect(self.boxSelectionChanged)
+        self.BoxList.itemDoubleClicked.connect(self.editBox)
+        # Connect to itemChanged to detect checkbox changes.
+        self.BoxList.itemChanged.connect(self.boxItemChanged)
+        self.BoxListDockName = get_str("detectionBoxposition")
+        self.BoxListDock = QDockWidget(self.BoxListDockName, self)
+        self.BoxListDock.setWidget(self.BoxList)
+        self.BoxListDock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.BoxListDock.setVisible(self.box_panel_visible)
+        listLayout.addWidget(self.BoxListDock)
+
+        #  ================== Lower Right Area  ==================
+        leftbtmtoolbox = QHBoxLayout()
+        leftbtmtoolbox.addWidget(self.SaveButton)
+        leftbtmtoolbox.addWidget(self.DelButton)
+        leftbtmtoolbox.addWidget(self.ResortButton)
+        self.toggleBoxPanelButton = QToolButton()
+        self.toggleBoxPanelButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggleBoxPanelButton.clicked.connect(self.toggle_box_panel_visibility)
+        leftbtmtoolbox.addWidget(self.toggleBoxPanelButton)
+        leftbtmtoolboxcontainer = QWidget()
+        leftbtmtoolboxcontainer.setLayout(leftbtmtoolbox)
+        listLayout.addWidget(leftbtmtoolboxcontainer)
+        self._update_box_panel_button_text()
+
+        self.dock = QDockWidget(get_str("boxLabelText"), self)
+        self.dock.setObjectName(get_str("labels"))
+        self.dock.setWidget(labelListContainer)
+
+        #  ================== Zoom Bar  ==================
+        self.imageSlider = QSlider(Qt.Horizontal)
+        self.imageSlider.valueChanged.connect(self.CanvasSizeChange)
+        self.imageSlider.setMinimum(-9)
+        self.imageSlider.setMaximum(510)
+        self.imageSlider.setSingleStep(1)
+        self.imageSlider.setTickPosition(QSlider.TicksBelow)
+        self.imageSlider.setTickInterval(1)
+
+        op = QGraphicsOpacityEffect()
+        op.setOpacity(0.2)
+        self.imageSlider.setGraphicsEffect(op)
+
+        self.imageSlider.setStyleSheet("background-color:transparent")
+        self.imageSliderDock = QDockWidget(get_str("ImageResize"), self)
+        self.imageSliderDock.setObjectName(get_str("IR"))
+        self.imageSliderDock.setWidget(self.imageSlider)
+        self.imageSliderDock.setFeatures(QDockWidget.DockWidgetFloatable)
+        self.imageSliderDock.setAttribute(Qt.WA_TranslucentBackground)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.imageSliderDock)
+
+        self.zoomWidget = ZoomWidget()
+        self.colorDialog = ColorDialog(parent=self)
+        self.zoomWidgetValue = self.zoomWidget.value()
+
+        self.msgBox = QMessageBox()
+
+        #  ================== Thumbnail ==================
+        hlayout = QHBoxLayout()
+        m = (0, 0, 0, 0)
+        hlayout.setSpacing(0)
+        hlayout.setContentsMargins(*m)
+        self.preButton = QToolButton()
+        self.preButton.setIcon(newIcon("prev", 40))
+        self.preButton.setIconSize(QSize(40, 100))
+        self.preButton.clicked.connect(self.openPrevImg)
+        self.preButton.setStyleSheet("border: none;")
+        self.preButton.setShortcut("a")
+        self.iconlist = QListWidget()
+        self.iconlist.setViewMode(QListView.IconMode)
+        self.iconlist.setFlow(QListView.TopToBottom)
+        self.iconlist.setSpacing(10)
+        self.iconlist.setIconSize(QSize(50, 50))
+        self.iconlist.setMovement(QListView.Static)
+        self.iconlist.setResizeMode(QListView.Adjust)
+        self.iconlist.itemClicked.connect(self.iconitemDoubleClicked)
+        self.iconlist.setStyleSheet(
+            "QListWidget{ background-color:transparent; border: none;}"
+        )
+        self.iconlist.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nextButton = QToolButton()
+        self.nextButton.setIcon(newIcon("next", 40))
+        self.nextButton.setIconSize(QSize(40, 100))
+        self.nextButton.setStyleSheet("border: none;")
+        self.nextButton.clicked.connect(self.openNextImg)
+        self.nextButton.setShortcut("d")
+
+        hlayout.addWidget(self.preButton)
+        hlayout.addWidget(self.iconlist)
+        hlayout.addWidget(self.nextButton)
+
+        iconListContainer = QWidget()
+        iconListContainer.setLayout(hlayout)
+        iconListContainer.setFixedHeight(100)
+
+        #  ================== Canvas ==================
+        self.canvas = Canvas(parent=self)
+        self.canvas.zoomRequest.connect(self.zoomRequest)
+        self.canvas.setDrawingShapeToSquare(settings.get(SETTING_DRAW_SQUARE, False))
+
+        scroll = QScrollArea()
+        scroll.setWidget(self.canvas)
+        scroll.setWidgetResizable(True)
+        self.scrollBars = {
+            Qt.Vertical: scroll.verticalScrollBar(),
+            Qt.Horizontal: scroll.horizontalScrollBar(),
+        }
+        self.scrollArea = scroll
+        self.canvas.scrollRequest.connect(self.scrollRequest)
+
+        self.canvas.newShape.connect(partial(self.newShape, False))
+        self.canvas.shapeMoved.connect(self.updateBoxlist)  # self.setDirty
+        self.canvas.selectionChanged.connect(self.shapeSelectionChanged)
+        self.canvas.drawingPolygon.connect(self.toggleDrawingSensitive)
+
+        centerLayout = QVBoxLayout()
+        centerLayout.setContentsMargins(0, 0, 0, 0)
+        centerLayout.addWidget(scroll)
+        centerLayout.addWidget(iconListContainer, 0, Qt.AlignCenter)
+        centerContainer = QWidget()
+        centerContainer.setLayout(centerLayout)
+
+        self.setCentralWidget(centerContainer)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+
+        self.dock.setFeatures(
+            QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetFloatable
+        )
+        self.fileDock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+
+        #  ================== Actions ==================
+        action = partial(newAction, self)
+        quit = action(get_str("quit"), self.close, "Ctrl+Q", "quit", get_str("quitApp"))
+
+        opendir = action(
+            get_str("openDir"), self.openDirDialog, "Ctrl+u", "open", get_str("openDir")
+        )
+
+        open_dataset_dir = action(
+            get_str("openDatasetDir"),
+            self.openDatasetDirDialog,
+            "Ctrl+p",
+            "open",
+            get_str("openDatasetDir"),
+            enabled=False,
+        )
+
+        save = action(
+            get_str("save"),
+            self.saveFile,
+            ["Ctrl+V", "end"],
+            "verify",
+            get_str("saveDetail"),
+            enabled=False,
+        )
+
+        alcm = action(
+            get_str("choosemodel"),
+            self.autolcm,
+            "Ctrl+M",
+            "next",
+            get_str("tipchoosemodel"),
+        )
+
+        deleteImg = action(
+            get_str("deleteImg"),
+            self.deleteImg,
+            "Ctrl+Shift+D",
+            "close",
+            get_str("deleteImgDetail"),
+            enabled=True,
+        )
+
+        resetAll = action(
+            get_str("resetAll"),
+            self.resetAll,
+            None,
+            "resetall",
+            get_str("resetAllDetail"),
+        )
+
+        color1 = action(
+            get_str("boxLineColor"),
+            self.chooseColor,
+            "Ctrl+L",
+            "color_line",
+            get_str("boxLineColorDetail"),
+        )
+
+        createMode = action(
+            get_str("crtBox"),
+            self.setCreateMode,
+            "w",
+            "new",
+            get_str("crtBoxDetail"),
+            enabled=False,
+        )
+        editMode = action(
+            "&Edit\nRectBox",
+            self.setEditMode,
+            "Ctrl+J",
+            "edit",
+            "Move and edit Boxs",
+            enabled=False,
+        )
+
+        create = action(
+            get_str("crtBox"),
+            self.createShape,
+            "w",
+            "objects",
+            get_str("crtBoxDetail"),
+            enabled=False,
+        )
+
+        delete = action(
+            get_str("delBox"),
+            self.deleteSelectedShape,
+            ["backspace", "delete"],
+            "delete",
+            get_str("delBoxDetail"),
+            enabled=False,
+        )
+
+        copy = action(
+            get_str("dupBox"),
+            self.copySelectedShape,
+            "Ctrl+C",
+            "copy",
+            get_str("dupBoxDetail"),
+            enabled=False,
+        )
+
+        hideAll = action(
+            get_str("hideBox"),
+            partial(self.togglePolygons, False),
+            "Ctrl+H",
+            "hide",
+            get_str("hideAllBoxDetail"),
+            enabled=False,
+        )
+        showAll = action(
+            get_str("showBox"),
+            partial(self.togglePolygons, True),
+            "Ctrl+A",
+            "hide",
+            get_str("showAllBoxDetail"),
+            enabled=False,
+        )
+
+        help = action(
+            get_str("tutorial"),
+            self.showTutorialDialog,
+            None,
+            "help",
+            get_str("tutorialDetail"),
+        )
+        showInfo = action(
+            get_str("info"), self.showInfoDialog, None, "help", get_str("info")
+        )
+        showSteps = action(
+            get_str("steps"), self.showStepsDialog, None, "help", get_str("steps")
+        )
+        showKeys = action(
+            get_str("keys"), self.showKeysDialog, None, "help", get_str("keys")
