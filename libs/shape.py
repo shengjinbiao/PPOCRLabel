@@ -12,8 +12,10 @@
 # THE SOFTWARE.
 # !/usr/bin/python
 # -*- coding: utf-8 -*-
+import copy
 import math
 import sys
+import uuid
 
 from PyQt5.QtCore import QPointF
 from PyQt5.QtGui import QColor, QPen, QPainterPath, QFont
@@ -70,6 +72,7 @@ class Shape(object):
         self.paintIdx = paintIdx
         self.locked = False
         self.rec_score = 1.0
+        self.is_ai_corrected = False
         self.direction = 0
         self.center = None
         self.epsilon = 5  # same as canvas
@@ -81,6 +84,8 @@ class Shape(object):
         }
         self.fontsize = 8
         self.char_candidates = []
+        self.history = []
+        self.instance_id = str(uuid.uuid4())
 
         self._closed = False
         self.font_family = font_family
@@ -274,6 +279,8 @@ class Shape(object):
             shape.fill_color = self.fill_color
         shape.difficult = self.difficult
         shape.key_cls = self.key_cls
+        shape.history = copy.deepcopy(getattr(self, "history", []))
+        shape.instance_id = str(uuid.uuid4())
         return shape
 
     def __len__(self):

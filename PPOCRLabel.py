@@ -25,12 +25,14 @@ import sys
 import tempfile
 import shutil
 import copy
+import uuid
 from pathlib import Path
 from functools import partial
 
 import openpyxl
 import cv2
 import numpy as np
+import requests
 
 from PyQt5.QtCore import (
     QSize,
@@ -122,6 +124,10 @@ from libs.constants import (
     SETTING_READING_ORDER,
     SETTING_RESULT_FONT_SIZE,
     SETTING_DET_PANEL_VISIBLE,
+    SETTING_PROOFREAD_ENDPOINT,
+    SETTING_PROOFREAD_STYLE,
+    SETTING_PROOFREAD_MODEL,
+    SETTING_PROOFREAD_API_KEY,
 )
 from libs.model_selector import (
     ModelSelectDialog,
@@ -156,6 +162,7 @@ from libs.canvas import Canvas
 from libs.zoomWidget import ZoomWidget
 from libs.autoDialog import AutoDialog
 from libs.labelDialog import LabelDialog
+from libs.proofreadDialog import ProofreadDialog
 from libs.colorDialog import ColorDialog
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
 from libs.editinlist import EditInList
@@ -169,6 +176,13 @@ from libs.char_selector import (
 import logging
 
 logger = logging.getLogger("PPOCRLabel")
+
+DEFAULT_PROOFREAD_URL = os.getenv(
+    "PPOCRLABEL_PROOFREAD_URL", "http://192.168.1.103:1234"
+)
+DEFAULT_PROOFREAD_STYLE = os.getenv("PPOCRLABEL_PROOFREAD_STYLE", "json").lower()
+DEFAULT_PROOFREAD_MODEL = os.getenv("PPOCRLABEL_PROOFREAD_MODEL", "")
+DEFAULT_PROOFREAD_API_KEY = os.getenv("PPOCRLABEL_PROOFREAD_API_KEY", "")
 
 
 __appname__ = "PPOCRLabel"
@@ -235,6 +249,10 @@ class MainWindow(QMainWindow):
         label_font_path=None,
         selected_shape_color=(255, 255, 0),
         text_layout_mode=None,
+        proofread_url=None,
+        proofread_style=None,
+        proofread_model=None,
+        proofread_api_key=None,
     ):
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
@@ -308,6 +326,39 @@ class MainWindow(QMainWindow):
             stored_reading_order = "horizontal"
         self.reading_mode = stored_reading_order
         self.settings[SETTING_READING_ORDER] = self.reading_mode
+        stored_proofreader_endpoint = settings.get(SETTING_PROOFREAD_ENDPOINT)
+        if proofread_url:
+            self.proofreader_endpoint = proofread_url
+            settings[SETTING_PROOFREAD_ENDPOINT] = proofread_url
+        elif stored_proofreader_endpoint:
+            self.proofreader_endpoint = stored_proofreader_endpoint
+        else:
+            self.proofreader_endpoint = DEFAULT_PROOFREAD_URL
+        stored_proofreader_style = settings.get(SETTING_PROOFREAD_STYLE)
+        chosen_style = proofread_style or stored_proofreader_style or DEFAULT_PROOFREAD_STYLE
+        if not isinstance(chosen_style, str):
+            chosen_style = "json"
+        chosen_style = chosen_style.lower()
+        if chosen_style not in ("json", "openai"):
+            chosen_style = "json"
+        self.proofreader_style = chosen_style
+        settings[SETTING_PROOFREAD_STYLE] = self.proofreader_style
+        stored_proofreader_model = settings.get(SETTING_PROOFREAD_MODEL, DEFAULT_PROOFREAD_MODEL)
+        if proofread_model is not None:
+            self.proofreader_model = proofread_model
+            settings[SETTING_PROOFREAD_MODEL] = proofread_model
+        else:
+            self.proofreader_model = stored_proofreader_model or DEFAULT_PROOFREAD_MODEL
+            settings[SETTING_PROOFREAD_MODEL] = self.proofreader_model
+        stored_proofreader_api_key = settings.get(
+            SETTING_PROOFREAD_API_KEY, DEFAULT_PROOFREAD_API_KEY
+        )
+        if proofread_api_key is not None:
+            self.proofreader_api_key = proofread_api_key
+            settings[SETTING_PROOFREAD_API_KEY] = proofread_api_key
+        else:
+            self.proofreader_api_key = stored_proofreader_api_key or ""
+        self.proofreader_timeout = 45
 
         self._reload_ocr_backends()
         rec_kwargs = {
@@ -371,7 +422,20 @@ class MainWindow(QMainWindow):
 
         # Main widgets and related state.
         self.labelDialog = LabelDialog(parent=self, listItem=self.labelHist)
+        self.lineProofDialog = ProofreadDialog(parent=self)
         self.autoDialog = AutoDialog(parent=self)
+
+        self.lineProofDialog.retranslate(
+            {
+                "title": get_str("manualProofreadDialogTitle"),
+                "stage": get_str("manualProofreadStageLabel"),
+                "history": get_str("manualProofreadHistoryLabel"),
+                "apply": get_str("manualProofreadApplyHistory"),
+                "text_placeholder": get_str("manualProofreadPlaceholder"),
+                "history_empty": get_str("manualProofreadHistoryEmpty"),
+            }
+        )
+        self._review_stage_options = ["初较", "二较", "终较"]
 
         self.itemsToShapes = {}
         self.shapesToItems = {}
@@ -385,6 +449,7 @@ class MainWindow(QMainWindow):
         self.low_confidence_threshold = 0.85
         self._low_confidence_brush = QBrush(QColor("#c62828"))
         self._default_label_brush = QBrush(QColor("#000000"))
+        self._ai_edit_brush = QBrush(QColor("#1565c0"))
 
         #  ================== File List  ==================
 
@@ -447,6 +512,14 @@ class MainWindow(QMainWindow):
         self.reRecogButton.setIcon(newIcon("reRec", 30))
         self.reRecogButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
+        self.proofreadButton = QToolButton()
+        self.proofreadButton.setIcon(newIcon("done", 30))
+        self.proofreadButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
+        self.manualProofButton = QToolButton()
+        self.manualProofButton.setIcon(newIcon("edit", 30))
+        self.manualProofButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
         self.tableRecButton = QToolButton()
         self.tableRecButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
@@ -466,7 +539,9 @@ class MainWindow(QMainWindow):
         leftTopToolBox.addWidget(self.newButton, 0, 0, 1, 1)
         leftTopToolBox.addWidget(self.createpolyButton, 0, 1, 1, 1)
         leftTopToolBox.addWidget(self.reRecogButton, 1, 0, 1, 1)
-        leftTopToolBox.addWidget(self.tableRecButton, 1, 1, 1, 1)
+        leftTopToolBox.addWidget(self.proofreadButton, 1, 1, 1, 1)
+        leftTopToolBox.addWidget(self.manualProofButton, 1, 2, 1, 1)
+        leftTopToolBox.addWidget(self.tableRecButton, 2, 0, 1, 3)
 
         leftTopToolBoxContainer = QWidget()
         leftTopToolBoxContainer.setLayout(leftTopToolBox)
@@ -933,6 +1008,24 @@ class MainWindow(QMainWindow):
             enabled=False,
         )
 
+        autoProofread = action(
+            get_str("autoProofread"),
+            self.autoProofread,
+            "",
+            "done",
+            get_str("autoProofreadDetail"),
+            enabled=False,
+        )
+
+        manualProofread = action(
+            get_str("manualProofread"),
+            self.openManualProofreadDialog,
+            "Ctrl+Alt+P",
+            "edit",
+            get_str("manualProofreadDetail"),
+            enabled=False,
+        )
+
         singleRere = action(
             get_str("singleRe"),
             self.singleRerecognition,
@@ -1077,6 +1170,8 @@ class MainWindow(QMainWindow):
         self.AutoRecognition.setMenu(self.autoRecognitionMenu)
         self.AutoRecognition.setPopupMode(QToolButton.MenuButtonPopup)
         self.reRecogButton.setDefaultAction(reRec)
+        self.proofreadButton.setDefaultAction(autoProofread)
+        self.manualProofButton.setDefaultAction(manualProofread)
         self.tableRecButton.setDefaultAction(tableRec)
         self.ResortButton.setDefaultAction(resort)
         # self.preButton.setDefaultAction(openPrevImg)
@@ -1192,6 +1287,8 @@ class MainWindow(QMainWindow):
             copy=copy,
             saveRec=saveRec,
             singleRere=singleRere,
+            autoProofread=autoProofread,
+            manualProofread=manualProofread,
             AutoRec=AutoRec,
             AutoRecCurrent=AutoRecCurrent,
             reRec=reRec,
@@ -1378,9 +1475,11 @@ class MainWindow(QMainWindow):
             self.menus.autolabel,
             (
                 AutoRec,
-                AutoRecCurrent,
-                reRec,
-                cellreRec,
+                 AutoRecCurrent,
+                 reRec,
+                 autoProofread,
+                 manualProofread,
+                 cellreRec,
                 trainAction,
                 customModelAction,
                 self.readingModeMenu,
@@ -1603,6 +1702,14 @@ class MainWindow(QMainWindow):
         items = self.labelList.selectedItems()
         if items:
             return items[0]
+        return None
+
+    def _get_single_active_shape(self):
+        if len(self.canvas.selectedShapes) == 1:
+            return self.canvas.selectedShapes[0]
+        current_item = self.currentItem()
+        if current_item:
+            return self.itemsToShapes.get(current_item)
         return None
 
     def currentBox(self):
@@ -1931,6 +2038,7 @@ class MainWindow(QMainWindow):
         self.actions.delete.setEnabled(n_selected)
         self.actions.copy.setEnabled(n_selected)
         self.actions.edit.setEnabled(n_selected == 1)
+        self.actions.manualProofread.setEnabled(n_selected == 1)
         self.actions.lock.setEnabled(n_selected)
         self.actions.change_cls.setEnabled(n_selected)
         self.actions.expand.setEnabled(n_selected)
@@ -2000,7 +2108,12 @@ class MainWindow(QMainWindow):
     def loadLabels(self, shapes):
         s = []
         shape_index = 0
-        for label, points, line_color, key_cls, difficult in shapes:
+        for entry in shapes:
+            if len(entry) >= 6:
+                label, points, line_color, key_cls, difficult, extras = entry[:6]
+            else:
+                label, points, line_color, key_cls, difficult = entry
+                extras = {}
             shape = Shape(
                 label=label,
                 line_color=line_color,
@@ -2017,6 +2130,17 @@ class MainWindow(QMainWindow):
             shape.difficult = difficult
             shape.idx = shape_index
             shape_index += 1
+            extras = extras or {}
+            history = extras.get("history")
+            if history:
+                shape.history = copy.deepcopy(history)
+                for entry in history:
+                    stage_name = entry.get("stage")
+                    if stage_name:
+                        self._remember_stage(stage_name)
+            instance_id = extras.get("instance_id")
+            if instance_id:
+                shape.instance_id = instance_id
             # shape.locked = False
             shape.close()
             s.append(shape)
@@ -2129,7 +2253,9 @@ class MainWindow(QMainWindow):
             and len(sequence) == len(shape.label or "")
             and all(isinstance(entry, dict) for entry in sequence)
         )
-        if has_char_scores:
+        if getattr(shape, "is_ai_corrected", False):
+            item.setForeground(self._ai_edit_brush)
+        elif has_char_scores:
             item.setForeground(self._default_label_brush)
         else:
             if score < self.low_confidence_threshold:
@@ -2137,7 +2263,10 @@ class MainWindow(QMainWindow):
             else:
                 item.setForeground(self._default_label_brush)
         if isinstance(score, (int, float)):
-            item.setToolTip(f"Confidence: {score:.2f}")
+            tooltip = f"Confidence: {score:.2f}"
+            if getattr(shape, "is_ai_corrected", False):
+                tooltip += " | AI"
+            item.setToolTip(tooltip)
 
     def saveLabels(self, annotationFilePath, mode="Auto"):
         # Mode is Auto means that labels will be loaded from self.result_dic totally, which is the output of ocr model
@@ -2152,6 +2281,8 @@ class MainWindow(QMainWindow):
                 points=[(int(p.x()), int(p.y())) for p in s.points],  # QPonitF
                 difficult=s.difficult,
                 key_cls=s.key_cls,
+                history=copy.deepcopy(getattr(s, "history", [])),
+                instance_id=getattr(s, "instance_id", None),
             )  # bool
 
         if mode == "Auto":
@@ -2191,6 +2322,11 @@ class MainWindow(QMainWindow):
                 }
                 if self.kie_mode:
                     trans_dict.update({"key_cls": box["key_cls"]})
+                history = copy.deepcopy(box.get("history") or [])
+                instance_id = box.get("instance_id") or str(uuid.uuid4())
+                trans_dict["history"] = history
+                trans_dict["instance_id"] = instance_id
+                box["instance_id"] = instance_id
                 trans_dic.append(trans_dict)
             self.PPlabel[annotationFilePath] = trans_dic
             if mode == "Auto":
@@ -2295,8 +2431,17 @@ class MainWindow(QMainWindow):
         if isinstance(item, HashableQListWidgetItem):
             shape = self.itemsToShapes[item]
             label = item.text()
+            old_label = shape.label or ""
             if label != shape.label:
                 shape.label = item.text()
+                shape.is_ai_corrected = False
+                self._record_shape_history(
+                    shape,
+                    shape.label,
+                    source="list-edit",
+                    previous_text=old_label,
+                )
+                self._update_label_item_style(shape)
                 # shape.line_color = generateColorByText(shape.label)
                 self.setDirty()
             elif not ((item.checkState() == Qt.Unchecked) ^ (not shape.difficult)):
@@ -2644,33 +2789,32 @@ class MainWindow(QMainWindow):
         width, height = self.image.width(), self.image.height()
         img_idx = self.getImglabelidx(filePath)
         shapes = []
-        # box['ratio'] of the shapes saved in lockedShapes contains the ratio of the
-        # four corner coordinates of the shapes to the height and width of the image
         for box in self.canvas.lockedShapes:
             key_cls = "None" if not self.kie_mode else box["key_cls"]
-            if self.canvas.isInTheSameImage:
-                shapes.append(
-                    (
-                        box["transcription"],
-                        [[s[0] * width, s[1] * height] for s in box["ratio"]],
-                        DEFAULT_LOCK_COLOR,
-                        key_cls,
-                        box["difficult"],
-                    )
+            extras = {"history": [], "instance_id": box.get("instance_id")}
+            points = [[s[0] * width, s[1] * height] for s in box["ratio"]]
+            label_text = (
+                box["transcription"]
+                if self.canvas.isInTheSameImage
+                else "锁定框：待检验"
+            )
+            shapes.append(
+                (
+                    label_text,
+                    points,
+                    DEFAULT_LOCK_COLOR,
+                    key_cls,
+                    box["difficult"],
+                    extras,
                 )
-            else:
-                shapes.append(
-                    (
-                        "锁定框：待检测",
-                        [[s[0] * width, s[1] * height] for s in box["ratio"]],
-                        DEFAULT_LOCK_COLOR,
-                        key_cls,
-                        box["difficult"],
-                    )
-                )
+            )
         if img_idx in self.PPlabel.keys():
             for box in self.PPlabel[img_idx]:
                 key_cls = "None" if not self.kie_mode else box.get("key_cls", "None")
+                extras = {
+                    "history": copy.deepcopy(box.get("history") or []),
+                    "instance_id": box.get("instance_id"),
+                }
                 shapes.append(
                     (
                         box["transcription"],
@@ -2678,13 +2822,13 @@ class MainWindow(QMainWindow):
                         None,
                         key_cls,
                         box.get("difficult", False),
+                        extras,
                     )
                 )
 
         if shapes:
             self.loadLabels(shapes)
             self.canvas.verified = False
-
     def validFilestate(self, filePath):
         if filePath in self.fileStatedict.keys() and self.fileStatedict[filePath] == 1:
             return True
@@ -2925,10 +3069,12 @@ class MainWindow(QMainWindow):
         self.AutoRecognitionNum.setValue(self.auto_recognition_num)
         self.AutoRecognition.setEnabled(True)
         self.reRecogButton.setEnabled(True)
+        self.proofreadButton.setEnabled(True)
         self.tableRecButton.setEnabled(True)
         self.actions.AutoRec.setEnabled(True)
         self.actions.AutoRecCurrent.setEnabled(True)
         self.actions.reRec.setEnabled(True)
+        self.actions.autoProofread.setEnabled(True)
         self.actions.tableRec.setEnabled(True)
         self.actions.open_dataset_dir.setEnabled(True)
         self.actions.rotateLeft.setEnabled(True)
@@ -3946,6 +4092,496 @@ class MainWindow(QMainWindow):
             return name.strip()
         return default_name
 
+    def _build_proofread_payload(self):
+        if not self.canvas.shapes:
+            raise ValueError("no shapes to proofread")
+        items = []
+        context_segments = []
+        for idx, shape in enumerate(self.canvas.shapes):
+            bbox = [[int(p.x()), int(p.y())] for p in shape.points]
+            text = shape.label or ""
+            score = getattr(shape, "rec_score", 0.0) or 0.0
+            entry = {
+                "index": idx,
+                "text": text,
+                "score": float(score),
+                "bbox": bbox,
+            }
+            if getattr(shape, "key_cls", None) and shape.key_cls != "None":
+                entry["key_cls"] = shape.key_cls
+            items.append(entry)
+            if text:
+                context_segments.append(text)
+        payload = {
+            "image_path": self.filePath,
+            "language": self.lang,
+            "context": "\n".join(context_segments),
+            "items": items,
+            "page_index": self.currIndex,
+        }
+        return payload
+
+    def _request_json_proofreader(self, payload):
+        response = requests.post(
+            self.proofreader_endpoint,
+            json=payload,
+            timeout=self.proofreader_timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _compose_openai_prompt(self, payload):
+        header = [
+            "请充当OCR校对助手。根据下面的识别结果和上下文，找出缺失或错误的文字，并输出 JSON：",
+            '{ "replacements": [ {"index": 0, "text": "替换后的文本", "score": 0.9} ] }',
+            "index 对应识别结果的序号，从 0 开始，仅在需要修改时返回该条。",
+            "不要编造坐标，若不确定请返回空数组。",
+        ]
+        context = payload.get("context") or ""
+        if not context.strip():
+            context = "(无上下文)"
+        lines = []
+        for item in payload.get("items", []):
+            idx = item.get("index")
+            text = item.get("text", "")
+            score = item.get("score", 0)
+            bbox = item.get("bbox", [])
+            lines.append(f"{idx}: '{text}' (score={score}, bbox={bbox})")
+        detail = "\n".join(lines)
+        prompt = "\n".join(header)
+        prompt += "\n上下文:\n" + context
+        prompt += "\n识别结果:\n" + detail
+        prompt += "\n请只返回 JSON。"
+        return prompt
+
+    def _extract_message_content(self, response_json):
+        content = None
+        if isinstance(response_json, dict):
+            choices = response_json.get("choices")
+            if choices:
+                first_choice = choices[0] or {}
+                message = first_choice.get("message") or {}
+                content = message.get("content")
+                if isinstance(content, list):
+                    fragments = []
+                    for chunk in content:
+                        if isinstance(chunk, dict):
+                            fragments.append(chunk.get("text", ""))
+                        else:
+                            fragments.append(str(chunk))
+                    content = "".join(fragments)
+            if content is None:
+                output = response_json.get("output") or response_json.get("response")
+                if isinstance(output, list) and output:
+                    first = output[0]
+                    if isinstance(first, dict):
+                        segment = first.get("content") or first.get("text")
+                        if isinstance(segment, list):
+                            fragments = []
+                            for chunk in segment:
+                                if isinstance(chunk, dict):
+                                    fragments.append(chunk.get("text", ""))
+                                else:
+                                    fragments.append(str(chunk))
+                            content = "".join(fragments)
+                        elif isinstance(segment, str):
+                            content = segment
+        if isinstance(content, str):
+            return content.strip()
+        return None
+
+    def _extract_json_from_text(self, text):
+        if not text:
+            return None
+        stripped = text.strip()
+        try:
+            return json.loads(stripped)
+        except Exception:
+            pass
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = stripped[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return None
+        return None
+
+    def _request_openai_proofreader(self, payload):
+        prompt = self._compose_openai_prompt(payload)
+        model_name = self.proofreader_model or "gpt-3.5-turbo"
+        body = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an OCR proofreader. Return JSON replacements only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.proofreader_api_key:
+            headers["Authorization"] = f"Bearer {self.proofreader_api_key}"
+        response = requests.post(
+            self.proofreader_endpoint,
+            json=body,
+            headers=headers,
+            timeout=self.proofreader_timeout,
+        )
+        response.raise_for_status()
+        response_json = response.json()
+        content = self._extract_message_content(response_json)
+        parsed = self._extract_json_from_text(content)
+        if parsed is None:
+            raise ValueError("Proofread response is not valid JSON.")
+        return parsed
+
+    def _normalize_proofread_changes(self, response_payload):
+        if response_payload is None:
+            return []
+        if isinstance(response_payload, list):
+            raw_entries = response_payload
+        elif isinstance(response_payload, dict):
+            raw_entries = response_payload.get("replacements")
+            if raw_entries is None:
+                raw_entries = response_payload.get("items")
+            if raw_entries is None:
+                suggestion = response_payload.get("text") or response_payload.get(
+                    "suggested_text"
+                )
+                if (
+                    isinstance(suggestion, str)
+                    and len(suggestion) == len(self.canvas.shapes)
+                ):
+                    raw_entries = [
+                        {"index": idx, "text": ch} for idx, ch in enumerate(suggestion)
+                    ]
+        else:
+            raw_entries = []
+
+        normalized = []
+        if not isinstance(raw_entries, list):
+            return normalized
+        expected_len = len(self.canvas.shapes)
+        for idx, entry in enumerate(raw_entries):
+            target_idx = None
+            text = None
+            score = None
+            if isinstance(entry, dict):
+                target_idx = entry.get("index")
+                text = entry.get("text")
+                score = entry.get("score")
+            else:
+                text = str(entry) if entry is not None else None
+            if target_idx is None and expected_len and len(raw_entries) == expected_len:
+                target_idx = idx
+            if text is None or target_idx is None:
+                continue
+            try:
+                target_idx = int(target_idx)
+            except (TypeError, ValueError):
+                continue
+            normalized.append(
+                {"index": target_idx, "text": str(text), "score": score}
+            )
+        return normalized
+
+    def _apply_proofread_suggestions(self, replacements):
+        updated = []
+        for change in replacements:
+            index = change.get("index")
+            new_text = change.get("text")
+            if index is None or new_text is None:
+                continue
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                continue
+            if index < 0 or index >= len(self.canvas.shapes):
+                continue
+            shape = self.canvas.shapes[index]
+            old_text = shape.label or ""
+            if old_text == new_text:
+                continue
+            shape.is_ai_corrected = True
+            shape.label = new_text
+            score = change.get("score")
+            if score is not None:
+                try:
+                    shape.rec_score = float(score)
+                except (TypeError, ValueError):
+                    pass
+            self._record_shape_history(
+                shape,
+                new_text,
+                source="auto-proofread",
+                previous_text=old_text,
+                extra={"score": score},
+            )
+            self.singleLabel(shape)
+            updated.append({"index": index, "old": old_text, "new": new_text})
+        if updated:
+            self.setDirty()
+            self.canvas.update()
+        return updated
+
+    def openManualProofreadDialog(self):
+        if not self.canvas.shapes:
+            QMessageBox.information(
+                self, "Information", self.get_str("manualProofreadNoBoxes")
+            )
+            return
+        shape = self._get_single_active_shape()
+        if shape is None:
+            shape = self._first_manual_proofread_shape()
+        if shape is None:
+            QMessageBox.information(
+                self, "Information", self.get_str("manualProofreadNeedSelection")
+            )
+            return
+        self._focus_shape_selection(shape)
+        running = True
+        current = shape
+        while running and current is not None:
+            proceed, direction = self._run_manual_proofread_session(current)
+            if not proceed:
+                break
+            if direction == 0:
+                break
+            neighbor = self._get_neighbor_shape_for_manual(current, direction)
+            if neighbor is None:
+                break
+            current = neighbor
+            self._focus_shape_selection(current)
+
+    def _build_shape_preview_pixmap(self, shape):
+        if not self.filePath or not os.path.exists(self.filePath):
+            return None
+        img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        box = np.array([[int(p.x()), int(p.y())] for p in shape.points], dtype=np.int32)
+        if box.size == 0:
+            return None
+        padded = boxPad(box, img.shape, pad=2)
+        try:
+            crop = get_rotate_crop_image(img, padded.astype(np.float32))
+        except Exception:
+            crop = None
+        if crop is None:
+            return None
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        height, width, channel = crop.shape
+        bytes_per_line = channel * width
+        qimg = QImage(crop.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
+
+    def _latest_history_stage(self, history):
+        if not history:
+            return ""
+        for entry in reversed(history):
+            stage = entry.get("stage")
+            if stage:
+                return stage
+        return ""
+
+    def _gather_stage_options(self, *extra):
+        options = list(self._review_stage_options)
+        for stage in extra:
+            if stage and stage not in options:
+                options.append(stage)
+        return options
+
+    def _remember_stage(self, stage):
+        if not stage:
+            return
+        if stage not in self._review_stage_options:
+            self._review_stage_options.append(stage)
+
+    def _ensure_shape_history(self, shape):
+        if not hasattr(shape, "history") or getattr(shape, "history") is None:
+            shape.history = []
+        return shape.history
+
+    def _record_shape_history(
+        self,
+        shape,
+        text,
+        source="manual",
+        previous_text="",
+        stage=None,
+        extra=None,
+    ):
+        history = self._ensure_shape_history(shape)
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "type": source,
+            "text": text,
+            "previous_text": previous_text,
+            "stage": stage,
+        }
+        if extra:
+            entry.update(extra)
+        history.append(entry)
+        shape.history = history
+
+    def _first_manual_proofread_shape(self):
+        for shape in self.canvas.shapes:
+            if shape.line_color != DEFAULT_LOCK_COLOR:
+                return shape
+        return self.canvas.shapes[0] if self.canvas.shapes else None
+
+    def _focus_shape_selection(self, shape):
+        if not shape:
+            return
+        try:
+            self.canvas.selectShapes([shape])
+        except Exception:
+            pass
+        item = self.shapesToItems.get(shape)
+        if item:
+            self.labelList.setCurrentItem(item)
+            self.labelList.scrollToItem(item)
+            index = self.labelList.indexFromItem(item).row()
+            if 0 <= index < self.indexList.count():
+                self.indexList.setCurrentRow(index)
+        box_item = self.shapesToItemsbox.get(shape)
+        if box_item:
+            self.BoxList.setCurrentItem(box_item)
+            self.BoxList.scrollToItem(box_item)
+
+    def _run_manual_proofread_session(self, shape):
+        pixmap = self._build_shape_preview_pixmap(shape)
+        if pixmap is None:
+            QMessageBox.warning(
+                self, "Warning", self.get_str("manualProofreadNoImage")
+            )
+        history = copy.deepcopy(getattr(shape, "history", []))
+        last_stage = self._latest_history_stage(history)
+        stage_options = self._gather_stage_options(last_stage)
+        self.lineProofDialog.prepare_for_shape()
+        self.lineProofDialog.set_history(history)
+        self.lineProofDialog.set_pixmap(pixmap)
+        self.lineProofDialog.set_text(shape.label or "")
+        self.lineProofDialog.set_stage_options(stage_options, last_stage or "")
+        accepted = self.lineProofDialog.exec_()
+        direction = self.lineProofDialog.take_navigation_direction()
+        if not accepted and direction == 0:
+            return False, 0
+        self._apply_manual_proofread_result(shape)
+        return True, direction
+
+    def _apply_manual_proofread_result(self, shape):
+        new_text, stage = self.lineProofDialog.get_result()
+        prev_text = shape.label or ""
+        text_changed = new_text != prev_text
+        if text_changed:
+            shape.label = new_text
+            shape.is_ai_corrected = False
+            self.singleLabel(shape)
+        if stage:
+            self._remember_stage(stage)
+        if text_changed or stage:
+            self._record_shape_history(
+                shape,
+                new_text if new_text is not None else "",
+                source="manual",
+                previous_text=prev_text,
+                stage=stage or None,
+            )
+            self.setDirty()
+            self.canvas.update()
+
+    def _get_neighbor_shape_for_manual(self, current_shape, direction):
+        if not self.canvas.shapes:
+            return None
+        try:
+            index = self.canvas.shapes.index(current_shape)
+        except ValueError:
+            return None
+        step = -1 if direction < 0 else 1
+        idx = index + step
+        while 0 <= idx < len(self.canvas.shapes):
+            candidate = self.canvas.shapes[idx]
+            if candidate.line_color != DEFAULT_LOCK_COLOR or candidate == current_shape:
+                return candidate
+            idx += step
+        return None
+
+    def autoProofread(self):
+        if not self.canvas.shapes:
+            QMessageBox.information(self, "Information", self.get_str("autoProofreadNoBoxes"))
+            return
+        if not self.proofreader_endpoint:
+            QMessageBox.warning(self, "Warning", self.get_str("autoProofreadNoEndpoint"))
+            return
+        try:
+            payload = self._build_proofread_payload()
+        except ValueError:
+            QMessageBox.information(self, "Information", self.get_str("autoProofreadNoBoxes"))
+            return
+        logger.info("Sending proofread request to %s", self.proofreader_endpoint)
+        self.statusBar().showMessage(self.get_str("autoProofreadRunning"))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if self.proofreader_style == "openai":
+                data = self._request_openai_proofreader(payload)
+            else:
+                data = self._request_json_proofreader(payload)
+        except requests.RequestException as exc:
+            logger.warning("Proofread request failed: %s", exc)
+            QMessageBox.warning(
+                self,
+                "Warning",
+                self.get_str("autoProofreadFailed").format(error=str(exc)),
+            )
+            return
+        except ValueError as exc:
+            logger.warning("Proofread response parse failed: %s", exc)
+            QMessageBox.warning(
+                self,
+                "Warning",
+                self.get_str("autoProofreadFailed").format(error=str(exc)),
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+        replacements = self._normalize_proofread_changes(data)
+        update_infos = self._apply_proofread_suggestions(replacements)
+        if update_infos:
+            change_lines = [
+                self.get_str("autoProofreadChangeLine").format(
+                    index=info["index"],
+                    old=info["old"],
+                    new=info["new"],
+                )
+                for info in update_infos
+            ]
+            max_lines = 10
+            preview = "\n".join(change_lines[:max_lines])
+            suffix = ""
+            if len(change_lines) > max_lines:
+                suffix = "\n" + self.get_str("autoProofreadAppliedMore").format(
+                    remaining=len(change_lines) - max_lines
+                )
+            QMessageBox.information(
+                self,
+                "Information",
+                self.get_str("autoProofreadApplied").format(
+                    count=len(update_infos)
+                )
+                + ("\n" + preview if preview else "")
+                + suffix,
+            )
+        else:
+            QMessageBox.information(
+                self, "Information", self.get_str("autoProofreadNoChange")
+            )
+
     def reRecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         if self.canvas.shapes:
@@ -3955,6 +4591,8 @@ class MainWindow(QMainWindow):
             )  # result_dic_locked stores the ocr result of self.canvas.lockedShapes
             rec_flag = 0
             for shape in self.canvas.shapes:
+                shape.is_ai_corrected = False
+                old_text = shape.label or ""
                 box = [[int(p.x()), int(p.y())] for p in shape.points]
                 kie_cls = shape.key_cls
 
@@ -4006,19 +4644,26 @@ class MainWindow(QMainWindow):
                             )
                         else:
                             self.result_dic.append([box, (self.noLabelText, 0)])
-                if not shape.char_candidates:
-                    shape.char_candidates = []
-                self._store_shape_confidence(shape, box)
-                try:
-                    if (
-                        self.noLabelText == shape.label
-                        or result["rec_text"] == shape.label
-                    ):
-                        logger.debug("label no change")
-                    else:
-                        rec_flag += 1
-                except IndexError as e:
-                    logger.warning("Can not recognise the box")
+            if not shape.char_candidates:
+                shape.char_candidates = []
+            self._store_shape_confidence(shape, box)
+            if (shape.label or "") != old_text:
+                self._record_shape_history(
+                    shape,
+                    shape.label or "",
+                    source="recognition",
+                    previous_text=old_text,
+                )
+            try:
+                if (
+                    self.noLabelText == shape.label
+                    or result["rec_text"] == shape.label
+                ):
+                    logger.debug("label no change")
+                else:
+                    rec_flag += 1
+            except IndexError as e:
+                logger.warning("Can not recognise the box")
             if (len(self.result_dic) > 0 and rec_flag > 0) or self.canvas.lockedShapes:
                 self.canvas.isInTheSameImage = True
                 self.saveFile(mode="Auto")
@@ -4040,6 +4685,8 @@ class MainWindow(QMainWindow):
     def singleRerecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         for shape in self.canvas.selectedShapes:
+            shape.is_ai_corrected = False
+            old_text = shape.label or ""
             box = [[int(p.x()), int(p.y())] for p in shape.points]
             if len(box) > 4:
                 box = self.gen_quad_from_poly(np.array(box))
@@ -4081,6 +4728,13 @@ class MainWindow(QMainWindow):
             self._store_shape_confidence(shape, box)
             self.singleLabel(shape)
             self.setDirty()
+            if (shape.label or "") != old_text:
+                self._record_shape_history(
+                    shape,
+                    shape.label or "",
+                    source="single-recognition",
+                    previous_text=old_text,
+                )
 
     def TableRecognition(self):
         """
@@ -4858,6 +5512,35 @@ def get_main_app(argv=[]):
         nargs="?",
         help="Preferred text layout direction for OCR inference.",
     )
+    arg_parser.add_argument(
+        "--proofread_url",
+        type=str,
+        default=None,
+        nargs="?",
+        help="Endpoint URL for the AI proofread button.",
+    )
+    arg_parser.add_argument(
+        "--proofread_style",
+        type=str,
+        choices=["json", "openai"],
+        default=None,
+        nargs="?",
+        help="Proofread API style: custom JSON endpoint or OpenAI-compatible chat completion.",
+    )
+    arg_parser.add_argument(
+        "--proofread_model",
+        type=str,
+        default=None,
+        nargs="?",
+        help="Model name when using OpenAI-compatible proofread endpoints.",
+    )
+    arg_parser.add_argument(
+        "--proofread_api_key",
+        type=str,
+        default=None,
+        nargs="?",
+        help="API key for OpenAI-compatible proofread endpoints.",
+    )
 
     args = arg_parser.parse_args(argv[1:])
 
@@ -4874,6 +5557,10 @@ def get_main_app(argv=[]):
         label_font_path=args.label_font_path,
         selected_shape_color=args.selected_shape_color,
         text_layout_mode=args.text_layout,
+        proofread_url=args.proofread_url,
+        proofread_style=args.proofread_style,
+        proofread_model=args.proofread_model,
+        proofread_api_key=args.proofread_api_key,
     )
     win.show()
     return app, win

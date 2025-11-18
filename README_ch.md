@@ -19,6 +19,19 @@ PPOCRLabelv3是一款适用于OCR领域的半自动化图形标注工具，内�
   - 通过菜单启动的训练任务结束后会自动定位最新 checkpoint，运行 tools/export_model.py 将推理模型导出到当前输出目录的 inference_时间戳 子目录，自动写入自定义检测模型配置并立即重载 PaddleOCR/PP-Structure，新模型无需手动切换即可生效。
   - 识别结果面板支持双击文字唤出模型返回的候选字符列表，可直接点击替换字符；若暂时没有候选，则保持普通编辑体验，避免来回切换键盘输入。
   - 识别结果列表会根据置信度自动高亮，低于 0.85 的条目以红色显示并提供悬浮提示，帮助快速发现可能的识别错误。
+  - 重新识别按钮旁新增 “AI自动校对” 按钮，会把当前页面的识别内容发送到本地语言模型（默认 `http://192.168.1.103:1234`，可用环境变量 `PPOCRLABEL_PROOFREAD_URL` 或启动参数 `--proofread_url` 自定义），让模型根据上下文猜测漏字或错字，并将返回的修改写回 UI。
+  - 在行校对弹窗中可以直接按 `↑/↓` 或点击“上一行 / 下一行”在相邻文本之间切换，并保持修改实时写回。
+  - 行校对支持缩放滑块与字体大小调节，方便把文字与截取的行图像对齐核查。
+  
+  启动命令：
+
+  - 新增 eScriptorium 风格的“行校对”弹窗，上方展示当前文本行的裁剪图像，下方提供文本编辑框，可在校对时快速比对图片。
+  - 重新识别、AI 校对以及人工修改都会写入“初较/二较”等校对历史，并随着 Label.txt 一起保存，避免重新识别覆盖人工成果。
+
+  - python .\PPOCRLabel.py --proofread_style openai --proofread_url http://192.168.1.103:1234/v1/chat/completions --proofread_model qwen2.5-7b-instruct 
+
+  - AI自动校对同时支持两种调用方式：自定义 JSON 接口和 OpenAI 兼容接口（LM Studio、OpenAI、DeepSeek 等均可直接使用 `POST /v1/chat/completions`）。
+  - 校对完成后弹窗会列出修改详情，并在“识别结果”面板中以**蓝色**标记所有由 AI 自动替换的文本，方便人工复核。
 - 2025.06:
   - 新增`重新排序坐标框位置`功能，使用方法详见下方`2.1 操作步骤`的`11. 补充功能说明`。
 - 2024.11:
@@ -168,6 +181,55 @@ PPOCRLabel.exe --lang ch
       - `c` ：按下后，此时使用键盘的上下左右按键将单独移动第3个顶点
       - `v` ：按下后，此时使用键盘的上下左右按键将单独移动第4个顶点
       - `b` ：按下后，此时使用键盘的上下左右按键将恢复默认的整体移动整个标记框
+    - `重新识别` 旁的 `AI自动校对`：在模型识别结果的基础上，把当前页面的识别文本、置信度与坐标发送给本地语言模型接口，由语言模型结合上下文猜测遗漏或错误的字符，并自动写回 UI。
+      - 默认向 `POST http://192.168.1.103:1234` 发送请求。可以通过环境变量 `PPOCRLABEL_PROOFREAD_URL` 或在启动命令中添加 `--proofread_url=http://127.0.0.1:9000/proofread` 来修改接口地址。
+      - 请求体示例：
+
+        ```json
+        {
+          "image_path": "D:/dataset/img_0003.jpg",
+          "language": "ch",
+          "page_index": 3,
+          "context": "桂花酸梅汤配方……",
+          "items": [
+            {
+              "index": 0,
+              "text": "桂花",
+              "score": 0.92,
+              "bbox": [[12,34],[98,34],[98,64],[12,64]]
+            },
+            {
+              "index": 1,
+              "text": "",
+              "score": 0.08,
+              "bbox": [[110,34],[180,34],[180,64],[110,64]]
+            }
+          ]
+        }
+        ```
+
+      - API 需要返回 `replacements`（或 `items`）数组，元素包含 `index`（对应 “识别结果” 面板的顺序）、`text` 以及可选的 `score`。示例：
+
+        ```json
+        {
+          "replacements": [
+            {"index": 1, "text": "酸", "score": 0.83}
+          ]
+        }
+        ```
+
+      - 如果接口返回为空或者 `index` 超过当前识别结果的数量，则不会修改任何标注。
+      - AI 自动校对完成后会弹出修改列表（最多显示 10 条，剩余条目以“……以及 X 条修改”提示），并在 “识别结果” 列表中以**蓝色**高亮所有由 AI 替换过的文字。
+      - 如果希望直接使用 OpenAI/LM Studio/DeepSeek 等兼容接口，可切换到 `openai` 模式：
+
+        ```powershell
+        set PPOCRLABEL_PROOFREAD_STYLE=openai
+        set PPOCRLABEL_PROOFREAD_URL=http://192.168.1.103:1234/v1/chat/completions
+        set PPOCRLABEL_PROOFREAD_MODEL=qwen2.5-7b-instruct
+        rem 如需鉴权再设置 PPOCRLABEL_PROOFREAD_API_KEY=sk-xxxx
+        ```
+
+        或者在启动参数中传入 `--proofread_style=openai --proofread_url=http://.../v1/chat/completions --proofread_model=qwen2.5-7b-instruct`。程序会自动把识别结果整理成 prompt，向 `/v1/chat/completions` 发送标准 OpenAI 请求，并解析模型返回的 JSON。若使用 LM Studio 默认配置，可保持 API Key 为空。
     - `右下方` -> `重新排序位置` : 点击后会将标注框按照从上到下、从左到右的顺序进行排列。用于解决表格结构标识时，需要手动补充矩形标识后的顺序调整问题。
 
 ### 2.2 表格标注（[视频演示](https://www.bilibili.com/video/BV1wR4y1v7JE/?share_source=copy_web&vd_source=cf1f9d24648d49636e3d109c9f9a377d&t=1998)）
