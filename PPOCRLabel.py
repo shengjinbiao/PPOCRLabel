@@ -172,6 +172,7 @@ from libs.char_selector import (
     CharacterCandidateController,
     enable_candidate_extraction,
 )
+from libs.lexicon_manager import LexiconLanguageModel
 
 import logging
 
@@ -360,6 +361,11 @@ class MainWindow(QMainWindow):
             self.proofreader_api_key = stored_proofreader_api_key or ""
         self.proofreader_timeout = 45
 
+        self.lexicon_manager = LexiconLanguageModel(
+            Path(__dir__) / "data" / "custom_words.txt",
+            Path(__dir__) / "data" / "custom_corpus.txt",
+        )
+
         self._reload_ocr_backends()
         rec_kwargs = {
             "device": self.gpu,
@@ -520,6 +526,10 @@ class MainWindow(QMainWindow):
         self.manualProofButton.setIcon(newIcon("edit", 30))
         self.manualProofButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
+        self.addLexiconButton = QToolButton()
+        self.addLexiconButton.setIcon(newIcon("save", 30))
+        self.addLexiconButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
         self.tableRecButton = QToolButton()
         self.tableRecButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
@@ -541,7 +551,8 @@ class MainWindow(QMainWindow):
         leftTopToolBox.addWidget(self.reRecogButton, 1, 0, 1, 1)
         leftTopToolBox.addWidget(self.proofreadButton, 1, 1, 1, 1)
         leftTopToolBox.addWidget(self.manualProofButton, 1, 2, 1, 1)
-        leftTopToolBox.addWidget(self.tableRecButton, 2, 0, 1, 3)
+        leftTopToolBox.addWidget(self.addLexiconButton, 2, 0, 1, 1)
+        leftTopToolBox.addWidget(self.tableRecButton, 2, 1, 1, 2)
 
         leftTopToolBoxContainer = QWidget()
         leftTopToolBoxContainer.setLayout(leftTopToolBox)
@@ -569,7 +580,7 @@ class MainWindow(QMainWindow):
         self.labelList = EditInList()
         self.charCandidateController = CharacterCandidateController(
             self.labelList,
-            lambda item: self.itemsToShapes.get(item),
+            lambda item: self._shape_from_label_item(item),
             candidate_loader=self._ensure_shape_candidates,
             low_threshold=self.low_confidence_threshold,
             low_color=self._low_confidence_brush.color(),
@@ -1026,6 +1037,24 @@ class MainWindow(QMainWindow):
             enabled=False,
         )
 
+        addToLexicon = action(
+            get_str("addToLexicon"),
+            self.addSelectedToLexicon,
+            "",
+            "save",
+            get_str("addToLexiconDetail"),
+            enabled=False,
+        )
+
+        addPageToLexicon = action(
+            get_str("addPageToLexicon"),
+            self.addPageToLexicon,
+            "",
+            "save",
+            get_str("addPageToLexiconDetail"),
+            enabled=False,
+        )
+
         singleRere = action(
             get_str("singleRe"),
             self.singleRerecognition,
@@ -1172,6 +1201,7 @@ class MainWindow(QMainWindow):
         self.reRecogButton.setDefaultAction(reRec)
         self.proofreadButton.setDefaultAction(autoProofread)
         self.manualProofButton.setDefaultAction(manualProofread)
+        self.addLexiconButton.setDefaultAction(addToLexicon)
         self.tableRecButton.setDefaultAction(tableRec)
         self.ResortButton.setDefaultAction(resort)
         # self.preButton.setDefaultAction(openPrevImg)
@@ -1289,6 +1319,8 @@ class MainWindow(QMainWindow):
             singleRere=singleRere,
             autoProofread=autoProofread,
             manualProofread=manualProofread,
+            addToLexicon=addToLexicon,
+            addPageToLexicon=addPageToLexicon,
             AutoRec=AutoRec,
             AutoRecCurrent=AutoRecCurrent,
             reRec=reRec,
@@ -1474,11 +1506,13 @@ class MainWindow(QMainWindow):
         addActions(
             self.menus.autolabel,
             (
-                AutoRec,
+                 AutoRec,
                  AutoRecCurrent,
                  reRec,
                  autoProofread,
                  manualProofread,
+                 addToLexicon,
+                 addPageToLexicon,
                  cellreRec,
                 trainAction,
                 customModelAction,
@@ -1709,7 +1743,35 @@ class MainWindow(QMainWindow):
             return self.canvas.selectedShapes[0]
         current_item = self.currentItem()
         if current_item:
-            return self.itemsToShapes.get(current_item)
+            return self._shape_from_label_item(current_item)
+        return None
+
+    def _shape_from_label_item(self, item):
+        """
+        Resolve the canvas shape associated with a label list item.
+
+        Some PyQt builds emit brand-new QListWidgetItem wrappers during
+        selection/edit events, which are not hashable and therefore cannot be
+        used as dictionary keys. We rely on the stored Qt.UserRole payload first,
+        then fall back to locating the item by row if needed.
+        """
+        if item is None:
+            return None
+        try:
+            return self.itemsToShapes[item]
+        except TypeError:
+            pass
+        except KeyError:
+            pass
+
+        shape = item.data(Qt.UserRole) if hasattr(item, "data") else None
+        if shape is not None:
+            return shape
+
+        if hasattr(self, "labelList"):
+            index = self.labelList.indexFromItem(item).row()
+            if 0 <= index < len(self.canvas.shapes):
+                return self.canvas.shapes[index]
         return None
 
     def currentBox(self):
@@ -2048,6 +2110,7 @@ class MainWindow(QMainWindow):
         shape.paintIdx = self.displayIndexOption.isChecked()
 
         item = HashableQListWidgetItem(shape.label)
+        item.setData(Qt.UserRole, shape)
         # current difficult checkbox is disable
         # item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         # item.setCheckState(Qt.Unchecked) if shape.difficult else item.setCheckState(Qt.Checked)
@@ -2068,6 +2131,7 @@ class MainWindow(QMainWindow):
         item = HashableQListWidgetItem(
             str([(int(p.x()), int(p.y())) for p in shape.points])
         )
+        item.setData(Qt.UserRole, shape)
         self.itemsToShapesbox[item] = shape
         self.shapesToItemsbox[shape] = item
         self.BoxList.addItem(item)
@@ -2234,13 +2298,63 @@ class MainWindow(QMainWindow):
         img_crop = get_rotate_crop_image(img, np.array(box, np.float32))
         if img_crop is None:
             return False
-        result = self.text_recognizer.predict(img_crop)[0]
+        result = self._decode_with_lexicon(self.text_recognizer.predict(img_crop)[0])
         candidates = result.get("char_candidates")
         if not candidates:
             return False
         shape.char_candidates = candidates
         self._store_shape_candidates(shape, box, candidates)
         return True
+
+    def _candidate_strings_from_char_candidates(self, char_candidates):
+        if not isinstance(char_candidates, list):
+            return []
+        if not char_candidates:
+            return []
+        best_chars = []
+        alt_chars = []
+        for entry in char_candidates:
+            if not isinstance(entry, dict):
+                continue
+            char = entry.get("char")
+            if char:
+                best_chars.append(str(char))
+            options = entry.get("candidates") or []
+            if options and isinstance(options, list):
+                best_alt = options[0].get("char")
+                if best_alt:
+                    alt_chars.append(str(best_alt))
+        extras = []
+        joined_best = "".join(best_chars).strip()
+        joined_alt = "".join(alt_chars).strip()
+        if joined_best:
+            extras.append(joined_best)
+        if joined_alt and joined_alt != joined_best:
+            extras.append(joined_alt)
+        return extras
+
+    def _decode_with_lexicon(self, result):
+        if not isinstance(result, dict):
+            return result
+        if not getattr(self, "lexicon_manager", None):
+            return result
+        rec_text = result.get("rec_text") or ""
+        candidates = self._candidate_strings_from_char_candidates(
+            result.get("char_candidates", [])
+        )
+        suggestion = self.lexicon_manager.suggest(
+            rec_text,
+            base_score=float(result.get("rec_score") or 0.0),
+            extra_candidates=candidates,
+        )
+        if suggestion and suggestion.text != rec_text:
+            updated = dict(result)
+            updated["raw_rec_text"] = rec_text
+            updated["rec_text"] = suggestion.text
+            updated["rec_score"] = suggestion.score
+            updated["lexicon_reason"] = suggestion.reason
+            return updated
+        return result
 
     def _update_label_item_style(self, shape):
         item = self.shapesToItems.get(shape)
@@ -2391,7 +2505,9 @@ class MainWindow(QMainWindow):
         if self.canvas.editing():
             selected_shapes = []
             for item in self.labelList.selectedItems():
-                selected_shapes.append(self.itemsToShapes[item])
+                shape = self._shape_from_label_item(item)
+                if shape:
+                    selected_shapes.append(shape)
             if selected_shapes:
                 self.canvas.selectShapes(selected_shapes)
             else:
@@ -2406,7 +2522,9 @@ class MainWindow(QMainWindow):
                 # map index item to label item
                 index = self.indexList.indexFromItem(item).row()
                 item = self.labelList.item(index)
-                selected_shapes.append(self.itemsToShapes[item])
+                shape = self._shape_from_label_item(item)
+                if shape:
+                    selected_shapes.append(shape)
             if selected_shapes:
                 self.canvas.selectShapes(selected_shapes)
             else:
@@ -2426,38 +2544,40 @@ class MainWindow(QMainWindow):
                 self.canvas.deSelectShape()
 
     def labelItemChanged(self, item):
-        # avoid accidentally triggering the itemChanged siganl with unhashable item
-        # Unknown trigger condition
-        if isinstance(item, HashableQListWidgetItem):
-            shape = self.itemsToShapes[item]
-            label = item.text()
-            old_label = shape.label or ""
-            if label != shape.label:
-                shape.label = item.text()
-                shape.is_ai_corrected = False
-                self._record_shape_history(
-                    shape,
-                    shape.label,
-                    source="list-edit",
-                    previous_text=old_label,
-                )
-                self._update_label_item_style(shape)
-                # shape.line_color = generateColorByText(shape.label)
-                self.setDirty()
-            elif not ((item.checkState() == Qt.Unchecked) ^ (not shape.difficult)):
-                shape.difficult = True if item.checkState() == Qt.Unchecked else False
-                self.setDirty()
-            else:  # User probably changed item visibility
-                self.canvas.setShapeVisible(
-                    shape, True
-                )  # item.checkState() == Qt.Checked
-                # self.actions.save.setEnabled(True)
-        else:
+        if item is None:
+            return
+
+        shape = self._shape_from_label_item(item)
+        if shape is None:
             logger.warning(
-                "enter labelItemChanged slot with unhashable item: %s %s",
+                "enter labelItemChanged slot with unresolved item: %s %s",
                 item,
-                item.text(),
+                item.text() if hasattr(item, "text") else "",
             )
+            return
+
+        label = item.text()
+        old_label = shape.label or ""
+        if label != shape.label:
+            shape.label = label
+            shape.is_ai_corrected = False
+            self._record_shape_history(
+                shape,
+                shape.label,
+                source="list-edit",
+                previous_text=old_label,
+            )
+            self._update_label_item_style(shape)
+            # shape.line_color = generateColorByText(shape.label)
+            self.setDirty()
+        elif not ((item.checkState() == Qt.Unchecked) ^ (not shape.difficult)):
+            shape.difficult = True if item.checkState() == Qt.Unchecked else False
+            self.setDirty()
+        else:  # User probably changed item visibility
+            self.canvas.setShapeVisible(
+                shape, True
+            )  # item.checkState() == Qt.Checked
+            # self.actions.save.setEnabled(True)
 
     def drag_drop_happened(self):
         """
@@ -3070,11 +3190,14 @@ class MainWindow(QMainWindow):
         self.AutoRecognition.setEnabled(True)
         self.reRecogButton.setEnabled(True)
         self.proofreadButton.setEnabled(True)
+        self.addLexiconButton.setEnabled(True)
         self.tableRecButton.setEnabled(True)
         self.actions.AutoRec.setEnabled(True)
         self.actions.AutoRecCurrent.setEnabled(True)
         self.actions.reRec.setEnabled(True)
         self.actions.autoProofread.setEnabled(True)
+        self.actions.addPageToLexicon.setEnabled(True)
+        self.actions.addToLexicon.setEnabled(True)
         self.actions.tableRec.setEnabled(True)
         self.actions.open_dataset_dir.setEnabled(True)
         self.actions.rotateLeft.setEnabled(True)
@@ -4322,6 +4445,13 @@ class MainWindow(QMainWindow):
                 extra={"score": score},
             )
             self.singleLabel(shape)
+            self._record_shape_history(
+                shape,
+                new_text,
+                source="auto-proofread",
+                previous_text=old_text,
+                extra={"score": score} if score is not None else None,
+            )
             updated.append({"index": index, "old": old_text, "new": new_text})
         if updated:
             self.setDirty()
@@ -4406,6 +4536,15 @@ class MainWindow(QMainWindow):
             shape.history = []
         return shape.history
 
+    def _ingest_lexicon_text(self, text):
+        if not text:
+            return
+        if getattr(self, "lexicon_manager", None):
+            try:
+                self.lexicon_manager.ingest_text(text)
+            except Exception as exc:
+                logger.warning("Failed to update lexicon: %s", exc)
+
     def _record_shape_history(
         self,
         shape,
@@ -4427,7 +4566,6 @@ class MainWindow(QMainWindow):
             entry.update(extra)
         history.append(entry)
         shape.history = history
-
     def _first_manual_proofread_shape(self):
         for shape in self.canvas.shapes:
             if shape.line_color != DEFAULT_LOCK_COLOR:
@@ -4510,6 +4648,64 @@ class MainWindow(QMainWindow):
                 return candidate
             idx += step
         return None
+
+    def addSelectedToLexicon(self):
+        if not getattr(self, "lexicon_manager", None):
+            QMessageBox.warning(self, "Warning", self.get_str("lexiconNotReady"))
+            return
+        if not self.canvas.shapes:
+            QMessageBox.information(self, "Information", self.get_str("autoProofreadNoBoxes"))
+            return
+        targets = list(self.canvas.selectedShapes)
+        if not targets:
+            QMessageBox.information(self, "Information", self.get_str("lexiconNeedSelection"))
+            return
+        texts = []
+        for shape in targets:
+            text = (shape.label or "").strip()
+            if text:
+                texts.append(text)
+        if not texts:
+            QMessageBox.information(self, "Information", self.get_str("lexiconNoText"))
+            return
+        before_words = len(self.lexicon_manager.word_set)
+        before_corpus = len(self.lexicon_manager.corpus_lines)
+        for text in texts:
+            self._ingest_lexicon_text(text)
+        added_words = len(self.lexicon_manager.word_set) - before_words
+        added_corpus = len(self.lexicon_manager.corpus_lines) - before_corpus
+        if self.lang == "ch":
+            msg = f"已加入词典 {max(added_words,0)} 条，语料 {max(added_corpus,0)} 条。"
+        else:
+            msg = f"Added {max(added_words,0)} lexicon entries, {max(added_corpus,0)} sentences."
+        QMessageBox.information(self, "Information", msg)
+
+    def addPageToLexicon(self):
+        if not getattr(self, "lexicon_manager", None):
+            QMessageBox.warning(self, "Warning", self.get_str("lexiconNotReady"))
+            return
+        if not self.canvas.shapes:
+            QMessageBox.information(self, "Information", self.get_str("autoProofreadNoBoxes"))
+            return
+        texts = []
+        for shape in self.canvas.shapes:
+            text = (shape.label or "").strip()
+            if text:
+                texts.append(text)
+        if not texts:
+            QMessageBox.information(self, "Information", self.get_str("lexiconNoText"))
+            return
+        before_words = len(self.lexicon_manager.word_set)
+        before_corpus = len(self.lexicon_manager.corpus_lines)
+        for text in texts:
+            self._ingest_lexicon_text(text)
+        added_words = len(self.lexicon_manager.word_set) - before_words
+        added_corpus = len(self.lexicon_manager.corpus_lines) - before_corpus
+        if self.lang == "ch":
+            msg = f"已加入词典 {max(added_words,0)} 条，语料 {max(added_corpus,0)} 条。"
+        else:
+            msg = f"Added {max(added_words,0)} lexicon entries, {max(added_corpus,0)} sentences."
+        QMessageBox.information(self, "Information", msg)
 
     def autoProofread(self):
         if not self.canvas.shapes:
@@ -4609,7 +4805,7 @@ class MainWindow(QMainWindow):
                     )
                     QMessageBox.information(self, "Information", msg)
                     return
-                result = self.text_recognizer.predict(img_crop)[0]
+                result = self._decode_with_lexicon(self.text_recognizer.predict(img_crop)[0])
                 shape.char_candidates = result.get("char_candidates", []) or []
                 self._store_shape_candidates(shape, box, shape.char_candidates)
                 storage = [(result["rec_text"], result["rec_score"])]
@@ -4700,9 +4896,9 @@ class MainWindow(QMainWindow):
                 )
                 QMessageBox.information(self, "Information", msg)
                 return
-            result = self.text_recognizer.predict(img_crop)[0]
-            score = float(result.get("rec_score") or 0.0)
-            shape.char_candidates = result.get("char_candidates", []) or []
+                result = self._decode_with_lexicon(self.text_recognizer.predict(img_crop)[0])
+                score = float(result.get("rec_score") or 0.0)
+                shape.char_candidates = result.get("char_candidates", []) or []
             self._store_shape_candidates(shape, box, shape.char_candidates)
             storage = [(result["rec_text"], result["rec_score"])]
             if result["rec_text"] != "":
@@ -4914,7 +5110,7 @@ class MainWindow(QMainWindow):
                 bboxes.reverse()  # top row text at first
                 for _bbox in bboxes:
                     patch = get_rotate_crop_image(img_crop, np.array(_bbox, np.float32))
-                    rec_res = self.text_recognizer.predict(patch)[0]
+                    rec_res = self._decode_with_lexicon(self.text_recognizer.predict(patch)[0])
                     text = rec_res["rec_text"]
                     if text != "":
                         texts += text + (

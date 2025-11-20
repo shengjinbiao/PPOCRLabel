@@ -126,8 +126,9 @@ class ProofreadDialog(QDialog):
         navLayout.addWidget(self.fontSizeSpin)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.imageLabel, 2)
+        layout.setSpacing(8)
         layout.addLayout(navLayout)
+        layout.addWidget(self.imageLabel, 2)
         layout.addWidget(textAndHistory, 3)
 
         self.buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)

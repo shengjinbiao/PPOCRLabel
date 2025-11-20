@@ -17,6 +17,7 @@ PPOCRLabelv3 is a semi-automatic graphic annotation tool suitable for OCR field,
 ### Recent Update
 - 2025.11:
   - Training jobs started from the menu now auto-export the latest checkpoint with `tools/export_model.py`, store it under `inference_<timestamp>` in the selected output directory, register the folder as the current custom detection model, and reload PaddleOCR/PP-Structure immediately so the new model is active without manual switching.
+  - Added lexicon/LM hot-update: use the `Add to Lexicon` (selected) or `Add Page to Lexicon` (entire page) buttons to append to `data/custom_words.txt` / `data/custom_corpus.txt`; the recognizer biases toward them without retraining.
 - 2025.06:
   - Add the `Resort Bounding Box Positions` features. For usage details, please refer to the `11. Additional Feature Description` in the `2.1 Operational Steps` section below.
 - 2024.11:
@@ -184,6 +185,7 @@ PPOCRLabel.exe --lang ch
       - `v`: After pressing, the up, down, left, and right arrow keys will move the 4th vertex individually.
       - `b`: After pressing, the up, down, left, and right arrow keys will revert to the default action of moving the entire bounding box.
     - `Bottom right` -> `Resort Positions`: Clicking this will arrange the bounding boxes in order from top to bottom and left to right. This is used to address the issue of manually adjusting the order after adding rectangular labels when identifying table structures.
+    - Lexicon hot-update: use the `Add to Lexicon` (selected boxes) or `Add Page to Lexicon` (all boxes on the page) buttons to append to `data/custom_words.txt` (phrases/words) and `data/custom_corpus.txt` (full sentences). The recognizer reloads these files on the fly and biases decoding toward the lexicon; no model retraining is needed.
 
 ### 2.2 Table Annotation
 
