@@ -85,6 +85,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QInputDialog,
+    QProgressDialog,
 )
 
 __dir__ = os.path.dirname(__file__)
@@ -778,6 +779,14 @@ class MainWindow(QMainWindow):
             get_str("openDir"), self.openDirDialog, "Ctrl+u", "open", get_str("openDir")
         )
 
+        import_pdf = action(
+            get_str("importPdf"),
+            self.importPdfDialog,
+            "Ctrl+Shift+U",
+            "file",
+            get_str("importPdfDetail"),
+        )
+
         open_dataset_dir = action(
             get_str("openDatasetDir"),
             self.openDatasetDirDialog,
@@ -1099,6 +1108,14 @@ class MainWindow(QMainWindow):
             get_str("saveRec"),
             enabled=False,
         )
+        exportFullText = action(
+            get_str("exportFullText"),
+            self.exportFullText,
+            "",
+            "save",
+            get_str("exportFullTextDetail"),
+            enabled=False,
+        )
 
         saveLabel = action(
             get_str("saveLabel"),
@@ -1316,6 +1333,7 @@ class MainWindow(QMainWindow):
             edit=edit,
             copy=copy,
             saveRec=saveRec,
+            exportFullText=exportFullText,
             singleRere=singleRere,
             autoProofread=autoProofread,
             manualProofread=manualProofread,
@@ -1343,6 +1361,7 @@ class MainWindow(QMainWindow):
             undo=undo,
             undoLastPoint=undoLastPoint,
             open_dataset_dir=open_dataset_dir,
+            importPdf=import_pdf,
             rotateLeft=rotateLeft,
             rotateRight=rotateRight,
             lock=lock,
@@ -1351,6 +1370,7 @@ class MainWindow(QMainWindow):
             resort=resort,
             fileMenuActions=(
                 opendir,
+                import_pdf,
                 open_dataset_dir,
                 saveLabel,
                 exportJSON,
@@ -1468,10 +1488,12 @@ class MainWindow(QMainWindow):
             self.menus.file,
             (
                 opendir,
+                import_pdf,
                 open_dataset_dir,
                 None,
                 saveLabel,
                 saveRec,
+                exportFullText,
                 exportJSON,
                 self.autoSaveOption,
                 self.autoReRecognitionOption,
@@ -3103,6 +3125,130 @@ class MainWindow(QMainWindow):
                 os.path.dirname(self.filePath) if self.filePath else "."
             )
 
+    def importPdfDialog(self):
+        if not self.mayContinue():
+            return
+
+        start_dir = (
+            self.lastOpenDir
+            if self.lastOpenDir and os.path.exists(self.lastOpenDir)
+            else "."
+        )
+        pdf_paths, _ = QFileDialog.getOpenFileNames(
+            self, self.get_str("selectPdf"), start_dir, "PDF Files (*.pdf)"
+        )
+        if not pdf_paths:
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            self.get_str("selectPdfOutputDir"),
+            start_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
+        )
+        if not output_dir:
+            return
+
+        total_pages = self._count_pdf_pages(pdf_paths)
+        progress = QProgressDialog(
+            self.get_str("pdfImportProgress").format(0, total_pages),
+            self.get_str("cancel"),
+            0,
+            total_pages,
+            self,
+        )
+        progress.setWindowTitle(self.get_str("importPdf"))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            converted = self._convert_pdfs_to_images(
+                pdf_paths, output_dir, progress=progress, total_pages=total_pages
+            )
+        except RuntimeError as e:
+            if "canceled" in str(e).lower():
+                QMessageBox.information(
+                    self, self.get_str("info"), self.get_str("pdfImportCancelled")
+                )
+                converted = []
+            else:
+                QMessageBox.warning(
+                    self, "Warning", self.get_str("pdfImportFailed").format(str(e))
+                )
+                converted = []
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Warning", self.get_str("pdfImportFailed").format(str(e))
+            )
+            converted = []
+        finally:
+            progress.close()
+            QApplication.restoreOverrideCursor()
+
+        if converted:
+            self.lastOpenDir = output_dir
+            self.importDirImages(output_dir)
+            QMessageBox.information(
+                self,
+                self.get_str("info"),
+                self.get_str("pdfImportSuccess").format(len(converted), output_dir),
+            )
+
+    def _count_pdf_pages(self, pdf_paths):
+        try:
+            import fitz  # PyMuPDF
+        except Exception as exc:  # pragma: no cover - import guard
+            raise RuntimeError(f"PyMuPDF import failed: {exc}") from exc
+
+        total = 0
+        for pdf_path in pdf_paths:
+            doc = fitz.open(pdf_path)
+            total += doc.page_count
+            doc.close()
+        return total
+
+    def _convert_pdfs_to_images(self, pdf_paths, output_dir, progress=None, total_pages=None):
+        try:
+            import fitz  # PyMuPDF
+        except Exception as exc:  # pragma: no cover - import guard
+            raise RuntimeError(f"PyMuPDF import failed: {exc}") from exc
+
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        converted_files = []
+        completed = 0
+        if progress and total_pages is not None:
+            progress.setMaximum(total_pages)
+
+        for pdf_path in pdf_paths:
+            doc = fitz.open(pdf_path)
+            try:
+                base_name = Path(pdf_path).stem
+                for page_index in range(doc.page_count):
+                    if progress and progress.wasCanceled():
+                        raise RuntimeError("canceled")
+                    page = doc.load_page(page_index)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    file_name = f"{base_name}_p{page_index + 1:03d}.png"
+                    img_path = output_root / file_name
+                    if img_path.exists():
+                        img_path = output_root / f"{base_name}_p{page_index + 1:03d}_{uuid.uuid4().hex[:6]}.png"
+                    pix.save(str(img_path))
+                    converted_files.append(str(img_path))
+                    completed += 1
+                    if progress and total_pages is not None:
+                        progress.setValue(completed)
+                        progress.setLabelText(
+                            self.get_str("pdfImportProgress").format(
+                                completed, total_pages
+                            )
+                        )
+                        QApplication.processEvents()
+            finally:
+                doc.close()
+
+        return converted_files
+
     def init_key_list(self, label_dict):
         if not self.kie_mode:
             return
@@ -3315,6 +3461,7 @@ class MainWindow(QMainWindow):
                 if not self.canvas.isInTheSameImage:
                     self.openNextImg()
                 self.actions.saveRec.setEnabled(True)
+                self.actions.exportFullText.setEnabled(True)
                 self.actions.saveLabel.setEnabled(True)
                 self.actions.exportJSON.setEnabled(True)
 
@@ -3589,6 +3736,17 @@ class MainWindow(QMainWindow):
         if len(file_path_split) == 1:
             return filePath
         return file_path_split[0] + "/" + file_path_split[1]
+
+    def _get_labels_for_image(self, filePath):
+        """Return labels for an image, tolerant to key formats and cache."""
+        idx = self.getImglabelidx(filePath)
+        fallback = os.path.basename(filePath)
+        for source in (getattr(self, "Cachelabel", {}), getattr(self, "PPlabel", {})):
+            if idx in source:
+                return source.get(idx)
+            if fallback in source:
+                return source.get(fallback)
+        return None
 
     def autoRecognitionNum(self, value):
         remain_num = len(self.mImgList) - self.currIndex
@@ -5282,6 +5440,7 @@ class MainWindow(QMainWindow):
                     self.fileStatedict[self.getImglabelidx(file)] = 1
                 self.actions.saveLabel.setEnabled(True)
                 self.actions.saveRec.setEnabled(True)
+                self.actions.exportFullText.setEnabled(True)
                 self.actions.exportJSON.setEnabled(True)
 
     def saveFilestate(self):
@@ -5348,13 +5507,15 @@ class MainWindow(QMainWindow):
 
         with open(rec_gt_dir, "w", encoding="utf-8") as f:
             for key in self.fileStatedict:
-                idx = self.getImglabelidx(key)
+                labels = self._get_labels_for_image(key)
+                if not labels:
+                    continue
                 try:
                     img_path = os.path.dirname(base_dir) + "/" + key
                     img = cv2.imdecode(
                         np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
                     )
-                    for i, label in enumerate(self.PPlabel[idx]):
+                    for i, label in enumerate(labels):
                         if label["difficult"]:
                             continue
                         img_crop = get_rotate_crop_image(
@@ -5387,6 +5548,55 @@ class MainWindow(QMainWindow):
             self,
             "Information",
             "Cropped images have been saved in " + str(crop_img_dir),
+        )
+
+    def exportFullText(self):
+        if not self.PPlabel or not self.mImgList:
+            QMessageBox.information(
+                self, "Information", self.get_str("exportFullTextEmpty")
+            )
+            return
+
+        base_dir = os.path.dirname(self.PPlabelpath)
+        default_path = os.path.join(base_dir, "full_text.txt")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.get_str("exportFullText"),
+            default_path,
+            "Text Files (*.txt)",
+        )
+        if not save_path:
+            return
+
+        lines = []
+        for img_path in self.mImgList:
+            labels = self._get_labels_for_image(img_path) or []
+            if not labels:
+                continue
+            for label in labels:
+                if label.get("difficult"):
+                    continue
+                text = label.get("transcription", "")
+                if text:
+                    lines.append(text)
+            lines.append("")  # page separator
+
+        while lines and lines[-1] == "":
+            lines.pop()
+
+        if not lines:
+            QMessageBox.information(
+                self, "Information", self.get_str("exportFullTextEmpty")
+            )
+            return
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        QMessageBox.information(
+            self,
+            "Information",
+            self.get_str("exportFullTextSuccess").format(save_path),
         )
 
     def speedChoose(self):

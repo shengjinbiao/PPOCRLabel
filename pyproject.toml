@@ -11,6 +11,7 @@ dependencies = [
   "paddlepaddle-gpu>=3.2.1",
   "paddlex[ocr]>=3.3.9",
   "openpyxl",
+  "pymupdf>=1.23.0",
   "tqdm",
   "premailer",
   "pandas",
