@@ -48,10 +48,24 @@ class Worker(QThread):
                         if h > 32 and w > 32:
                             result = self.ocr.predict(img)[0]
                             self.result_dic = []
+                            rec_polys = result["rec_polys"]
+                            rec_texts = result["rec_texts"]
+                            rec_scores = result["rec_scores"]
+                            if getattr(self.mainThread, "layout_first", False):
+                                (
+                                    rec_polys,
+                                    rec_texts,
+                                    rec_scores,
+                                ) = self.mainThread.reorder_ocr_result_by_layout(
+                                    rec_polys,
+                                    rec_texts,
+                                    rec_scores,
+                                    w,
+                                )
                             for poly, text, score in zip(
-                                result["rec_polys"],
-                                result["rec_texts"],
-                                result["rec_scores"],
+                                rec_polys,
+                                rec_texts,
+                                rec_scores,
                             ):
                                 # Convert numpy array to list for JSON serialization
                                 poly_list = (
@@ -63,6 +77,10 @@ class Worker(QThread):
                                 "The size of %s is too small to be recognised", img_path
                             )
                             self.result_dic = None
+                    elif self.model == "ppstructure":
+                        self.result_dic = self.mainThread._ppstructure_recognize(
+                            img_path
+                        )
 
                     # 结果保存
                     if self.result_dic is None or len(self.result_dic) == 0:
@@ -108,6 +126,7 @@ class AutoDialog(QDialog):
         ocr=None,
         image_list=None,
         len_bar=0,
+        model="paddle",
     ):
         super(AutoDialog, self).__init__(parent)
         self.setFixedWidth(1000)
@@ -139,7 +158,7 @@ class AutoDialog(QDialog):
 
         # self.setWindowFlags(Qt.WindowCloseButtonHint)
 
-        self.thread_1 = Worker(self.ocr, self.img_list, self.parent, "paddle")
+        self.thread_1 = Worker(self.ocr, self.img_list, self.parent, model)
         self.thread_1.progressBarValue.connect(self.handleProgressBarSingal)
         self.thread_1.listValue.connect(self.handleListWidgetSingal)
         self.thread_1.end_signal.connect(self.handleEndsignalSignal)

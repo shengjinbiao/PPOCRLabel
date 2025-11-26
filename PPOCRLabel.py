@@ -129,6 +129,9 @@ from libs.constants import (
     SETTING_PROOFREAD_STYLE,
     SETTING_PROOFREAD_MODEL,
     SETTING_PROOFREAD_API_KEY,
+    SETTING_LAYOUT_ANALYSIS,
+    SETTING_USE_PPSTRUCTURE,
+    SETTING_TWO_COLUMN_LR,
 )
 from libs.model_selector import (
     ModelSelectDialog,
@@ -328,6 +331,35 @@ class MainWindow(QMainWindow):
             stored_reading_order = "horizontal"
         self.reading_mode = stored_reading_order
         self.settings[SETTING_READING_ORDER] = self.reading_mode
+        stored_layout_analysis = settings.get(SETTING_LAYOUT_ANALYSIS, False)
+        if isinstance(stored_layout_analysis, str):
+            stored_layout_analysis = stored_layout_analysis.lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self.layout_first = bool(stored_layout_analysis)
+        self.settings[SETTING_LAYOUT_ANALYSIS] = self.layout_first
+        stored_ppstructure = settings.get(SETTING_USE_PPSTRUCTURE, False)
+        if isinstance(stored_ppstructure, str):
+            stored_ppstructure = stored_ppstructure.lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self.use_ppstructure = bool(stored_ppstructure)
+        self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
+        stored_two_col = settings.get(SETTING_TWO_COLUMN_LR, False)
+        if isinstance(stored_two_col, str):
+            stored_two_col = stored_two_col.lower() in ("1", "true", "yes", "on")
+        self.two_column_lr = bool(stored_two_col)
+        self.settings[SETTING_TWO_COLUMN_LR] = self.two_column_lr
+        # Preload PP-Structure engine on startup when enabled to avoid double initialization later.
+        self._ppstructure_engine = None
+        if self.use_ppstructure:
+            self._get_ppstructure_engine()
         stored_proofreader_endpoint = settings.get(SETTING_PROOFREAD_ENDPOINT)
         if proofread_url:
             self.proofreader_endpoint = proofread_url
@@ -1304,6 +1336,27 @@ class MainWindow(QMainWindow):
             lambda: self.changeReadingOrder("vertical"),
             checkable=True,
         )
+        self.layoutAnalysisAction = action(
+            get_str("layoutFirst"),
+            self.toggleLayoutAnalysis,
+            tip=get_str("layoutFirstDetail"),
+            checkable=True,
+        )
+        self.layoutAnalysisAction.setChecked(self.layout_first)
+        self.ppstructureAction = action(
+            get_str("usePPStructure"),
+            self.togglePPStructure,
+            tip=get_str("usePPStructureDetail"),
+            checkable=True,
+        )
+        self.ppstructureAction.setChecked(self.use_ppstructure)
+        self.twoColumnLRAction = action(
+            get_str("twoColumnLR"),
+            self.toggleTwoColumnLR,
+            tip=get_str("twoColumnLRDetail"),
+            checkable=True,
+        )
+        self.twoColumnLRAction.setChecked(self.two_column_lr)
         self.readingModeActionGroup = QActionGroup(self)
         self.readingModeActionGroup.setExclusive(True)
         self.readingModeActionGroup.addAction(reading_horizontal)
@@ -1341,6 +1394,9 @@ class MainWindow(QMainWindow):
             addPageToLexicon=addPageToLexicon,
             AutoRec=AutoRec,
             AutoRecCurrent=AutoRecCurrent,
+            layoutFirst=self.layoutAnalysisAction,
+            usePPStructure=self.ppstructureAction,
+            twoColumnLR=self.twoColumnLRAction,
             reRec=reRec,
             cellreRec=cellreRec,
             train=trainAction,
@@ -1534,12 +1590,15 @@ class MainWindow(QMainWindow):
                  autoProofread,
                  manualProofread,
                  addToLexicon,
-                 addPageToLexicon,
-                 cellreRec,
+                addPageToLexicon,
+                cellreRec,
                 trainAction,
                 customModelAction,
+                self.ppstructureAction,
+                self.twoColumnLRAction,
                 self.readingModeMenu,
                 self.textLayoutMenu,
+                self.layoutAnalysisAction,
                 alcm,
                 None,
                 help,
@@ -3817,6 +3876,7 @@ class MainWindow(QMainWindow):
             ocr=self.ocr,
             image_list=uncheckedList,
             len_bar=len(uncheckedList),
+            model="ppstructure" if self.use_ppstructure else "paddle",
         )
         self.autoDialog.popUp()
         self.haveAutoReced = True
@@ -4309,6 +4369,290 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             self.get_str("readingOrderChanged").format(label), 3000
         )
+
+    def toggleLayoutAnalysis(self, checked):
+        self.layout_first = bool(checked)
+        self.settings[SETTING_LAYOUT_ANALYSIS] = self.layout_first
+        self.settings.save()
+        message = (
+            self.get_str("layoutFirstStatusOn")
+            if self.layout_first
+            else self.get_str("layoutFirstStatusOff")
+        )
+        self.statusBar().showMessage(message, 3000)
+
+    def togglePPStructure(self, checked):
+        self.use_ppstructure = bool(checked)
+        self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
+        self.settings.save()
+        message = (
+            self.get_str("usePPStructureStatusOn")
+            if self.use_ppstructure
+            else self.get_str("usePPStructureStatusOff")
+        )
+        self.statusBar().showMessage(message, 3000)
+
+    def toggleTwoColumnLR(self, checked):
+        self.two_column_lr = bool(checked)
+        self.settings[SETTING_TWO_COLUMN_LR] = self.two_column_lr
+        self.settings.save()
+        message = (
+            self.get_str("twoColumnLRStatusOn")
+            if self.two_column_lr
+            else self.get_str("twoColumnLRStatusOff")
+        )
+        self.statusBar().showMessage(message, 3000)
+
+    def reorder_ocr_result_by_layout(self, polys, texts, scores, image_width):
+        if not polys or image_width is None or image_width <= 0:
+            return polys, texts, scores
+        try:
+            widths = []
+            boxes = []
+            for idx, poly in enumerate(polys):
+                arr = np.array(poly)
+                xs = arr[:, 0]
+                ys = arr[:, 1]
+                widths.append(float(xs.max() - xs.min()))
+                boxes.append(
+                    {
+                        "idx": idx,
+                        "x0": float(xs.min()),
+                        "x1": float(xs.max()),
+                        "y0": float(ys.min()),
+                        "y1": float(ys.max()),
+                    }
+                )
+            boxes.sort(key=lambda b: (b["x0"], b["y0"]))
+            median_width = float(np.median(widths)) if widths else 0.0
+            # Try to detect a clear vertical split (e.g., gutter/center line) and use it as left/right boundary.
+            best_gap = 0.0
+            best_split = None
+            centered_split = None
+            center_x = image_width / 2.0
+            center_tolerance = image_width * 0.2
+            gap_threshold = max(image_width * 0.03, median_width * 0.6, 16.0)
+            for i in range(len(boxes) - 1):
+                current = boxes[i]
+                nxt = boxes[i + 1]
+                gap = nxt["x0"] - current["x1"]
+                if gap > best_gap and gap >= gap_threshold:
+                    best_gap = gap
+                    best_split = current["x1"] + gap / 2.0
+                if gap >= gap_threshold:
+                    candidate_center = current["x1"] + gap / 2.0
+                    if abs(candidate_center - center_x) <= center_tolerance:
+                        if centered_split is None or gap > centered_split["gap"]:
+                            centered_split = {"center": candidate_center, "gap": gap}
+            chosen_split = None
+            if centered_split is not None:
+                chosen_split = centered_split["center"]
+            elif best_split is not None:
+                chosen_split = best_split
+            if chosen_split is not None:
+                left = [b for b in boxes if b["x0"] < chosen_split]
+                right = [b for b in boxes if b["x0"] >= chosen_split]
+                left.sort(key=lambda b: (b["y0"], b["x0"]))
+                right.sort(key=lambda b: (b["y0"], b["x0"]))
+                ordered = left + right
+                indices = [b["idx"] for b in ordered]
+                return (
+                    [polys[i] for i in indices],
+                    [texts[i] for i in indices],
+                    [scores[i] for i in indices],
+                )
+            column_gap = max(image_width * 0.02, median_width * 0.3, 12.0)
+            columns = []
+            for b in boxes:
+                placed = False
+                for col in columns:
+                    if b["x0"] <= col["max_x"] + column_gap:
+                        col["items"].append(b)
+                        col["max_x"] = max(col["max_x"], b["x1"])
+                        col["min_x"] = min(col["min_x"], b["x0"])
+                        placed = True
+                        break
+                if not placed:
+                    columns.append(
+                        {"items": [b], "max_x": b["x1"], "min_x": b["x0"]}
+                    )
+            columns.sort(key=lambda c: c["min_x"])
+            ordered = []
+            for col in columns:
+                col["items"].sort(key=lambda b: (b["y0"], b["x0"]))
+                ordered.extend(col["items"])
+            indices = [b["idx"] for b in ordered]
+            return (
+                [polys[i] for i in indices],
+                [texts[i] for i in indices],
+                [scores[i] for i in indices],
+            )
+        except Exception as exc:
+            logger.warning("Layout reordering failed: %s", exc)
+            return polys, texts, scores
+
+    def _get_ppstructure_engine(self):
+        if getattr(self, "_ppstructure_engine", None) is None:
+            try:
+                self._ppstructure_engine = PPStructureV3(
+                    layout_detection_model_dir=self.settings.get(
+                        "ppstructure_layout_dir",
+                        r"C:\Users\sheng\.paddlex\official_models\PP-DocLayout_plus-L",
+                    ),
+                    use_region_detection=True,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=self.use_vertical_text,
+                )
+                logger.info("Initialized PP-Structure engine")
+            except Exception as exc:
+                logger.error("Failed to init PP-Structure engine: %s", exc)
+                self._ppstructure_engine = None
+        return getattr(self, "_ppstructure_engine", None)
+
+    def _ppstructure_recognize(self, image_path):
+        engine = self._get_ppstructure_engine()
+        if engine is None:
+            return None
+
+        def _sort_blocks(blocks, page_width):
+            if not blocks:
+                return blocks
+            rects = []
+            for idx, (_, poly) in enumerate(blocks):
+                try:
+                    arr = np.array(poly)
+                    xs = arr[:, 0]
+                    ys = arr[:, 1]
+                    rects.append(
+                        {
+                            "idx": idx,
+                            "x0": float(xs.min()),
+                            "x1": float(xs.max()),
+                            "y0": float(ys.min()),
+                            "y1": float(ys.max()),
+                        }
+                    )
+                except Exception:
+                    continue
+            if not rects:
+                return blocks
+            # Two-column mode: force center split, read left then right
+            if self.two_column_lr and page_width:
+                split = page_width / 2.0
+                left = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) < split]
+                right = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) >= split]
+                left.sort(key=lambda r: (r["y0"], r["x0"]))
+                right.sort(key=lambda r: (r["y0"], r["x0"]))
+                ordered = [blocks[r["idx"]] for r in left] + [
+                    blocks[r["idx"]] for r in right
+                ]
+                return ordered
+            # Default: try to find a strong central split
+            if page_width:
+                centers = sorted(
+                    [(r["idx"], (r["x0"] + r["x1"]) / 2.0) for r in rects],
+                    key=lambda x: x[1],
+                )
+                best = None
+                center_x = page_width / 2.0
+                for i in range(len(centers) - 1):
+                    gap = centers[i + 1][1] - centers[i][1]
+                    if gap <= page_width * 0.05:
+                        continue
+                    mid = (centers[i + 1][1] + centers[i][1]) / 2.0
+                    dist = abs(mid - center_x)
+                    if best is None or dist < best["dist"]:
+                        best = {"mid": mid, "dist": dist, "gap": gap}
+                if best:
+                    split = best["mid"]
+                    left = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) < split]
+                    right = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) >= split]
+                    left.sort(key=lambda r: (r["y0"], r["x0"]))
+                    right.sort(key=lambda r: (r["y0"], r["x0"]))
+                    ordered = [blocks[r["idx"]] for r in left] + [
+                        blocks[r["idx"]] for r in right
+                    ]
+                    return ordered
+
+            median_width = float(np.median([r["x1"] - r["x0"] for r in rects]))
+            col_gap = max(
+                12.0,
+                median_width * 0.5 if median_width > 0 else 0.0,
+                (page_width or 0) * 0.03 if page_width else 0.0,
+            )
+            rects.sort(key=lambda r: (r["x0"], r["y0"]))
+            columns = []
+            for r in rects:
+                placed = False
+                for col in columns:
+                    if r["x0"] <= col["max_x"] + col_gap:
+                        col["items"].append(r)
+                        col["max_x"] = max(col["max_x"], r["x1"])
+                        placed = True
+                        break
+                if not placed:
+                    columns.append({"items": [r], "max_x": r["x1"]})
+            columns.sort(key=lambda c: c["items"][0]["x0"])
+            ordered = []
+            for col in columns:
+                col["items"].sort(key=lambda r: (r["y0"], r["x0"]))
+                ordered.extend(blocks[r["idx"]] for r in col["items"])
+            return ordered
+
+        try:
+            res = engine.predict(image_path)
+            if not res:
+                return None
+            entry = res[0] if isinstance(res, (list, tuple)) else res
+            ocr_res = entry.get("overall_ocr_res") or {}
+
+            width = None
+            try:
+                img_arr = entry.get("doc_preprocessor_res", {}).get("output_img")
+                if img_arr is not None:
+                    width = img_arr.shape[1]
+            except Exception:
+                width = None
+
+            parsing_list = entry.get("parsing_res_list") or []
+            if parsing_list:
+                result = []
+                allowed_labels = {"text", "paragraph_title", "header", "number"}
+                blocks = []
+                for reg in parsing_list:
+                    if not isinstance(reg, dict):
+                        continue
+                    label = reg.get("label") or ""
+                    if label not in allowed_labels:
+                        continue
+                    bbox = reg.get("bbox") or reg.get("coordinate") or None
+                    content = reg.get("content") or ""
+                    if not bbox or len(bbox) != 4 or not content:
+                        continue
+                    x0, y0, x1, y1 = bbox
+                    poly = [
+                        [float(x0), float(y0)],
+                        [float(x1), float(y0)],
+                        [float(x1), float(y1)],
+                        [float(x0), float(y1)],
+                    ]
+                    blocks.append([poly, (content, 1.0)])
+                if blocks:
+                    blocks = _sort_blocks(blocks, width)
+                    return blocks
+
+            polys = ocr_res.get("rec_polys") or ocr_res.get("dt_polys") or []
+            texts = ocr_res.get("rec_texts") or []
+            scores = ocr_res.get("rec_scores") or []
+            result = []
+            for poly, text, score in zip(polys, texts, scores):
+                poly_list = poly.tolist() if hasattr(poly, "tolist") else poly
+                result.append([poly_list, (text, float(score))])
+            return result
+        except Exception as exc:
+            logger.error("PP-Structure recognition failed on %s: %s", image_path, exc)
+            return None
 
     def chooseCustomModels(self):
         official_dir = self._get_official_model_dir()
@@ -5512,21 +5856,21 @@ class MainWindow(QMainWindow):
                     continue
                 try:
                     img_path = os.path.dirname(base_dir) + "/" + key
-                    img = cv2.imdecode(
-                        np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
-                    )
-                    for i, label in enumerate(labels):
-                        if label["difficult"]:
-                            continue
-                        img_crop = get_rotate_crop_image(
-                            img, np.array(label["points"], np.float32)
+                        img = cv2.imdecode(
+                            np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
                         )
-                        img_name = (
-                            os.path.splitext(os.path.basename(idx))[0]
-                            + "_crop_"
-                            + str(i)
-                            + ".jpg"
-                        )
+                        for i, label in enumerate(labels):
+                            if label["difficult"]:
+                                continue
+                            img_crop = get_rotate_crop_image(
+                                img, np.array(label["points"], np.float32)
+                            )
+                            img_name = (
+                                os.path.splitext(os.path.basename(key))[0]
+                                + "_crop_"
+                                + str(i)
+                                + ".jpg"
+                            )
                         cv2.imencode(".jpg", img_crop)[1].tofile(
                             crop_img_dir + img_name
                         )
