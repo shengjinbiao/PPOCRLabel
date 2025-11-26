@@ -5856,21 +5856,21 @@ class MainWindow(QMainWindow):
                     continue
                 try:
                     img_path = os.path.dirname(base_dir) + "/" + key
-                        img = cv2.imdecode(
-                            np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
+                    img = cv2.imdecode(
+                        np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
+                    )
+                    for i, label in enumerate(labels):
+                        if label["difficult"]:
+                            continue
+                        img_crop = get_rotate_crop_image(
+                            img, np.array(label["points"], np.float32)
                         )
-                        for i, label in enumerate(labels):
-                            if label["difficult"]:
-                                continue
-                            img_crop = get_rotate_crop_image(
-                                img, np.array(label["points"], np.float32)
-                            )
-                            img_name = (
-                                os.path.splitext(os.path.basename(key))[0]
-                                + "_crop_"
-                                + str(i)
-                                + ".jpg"
-                            )
+                        img_name = (
+                            os.path.splitext(os.path.basename(key))[0]
+                            + "_crop_"
+                            + str(i)
+                            + ".jpg"
+                        )
                         cv2.imencode(".jpg", img_crop)[1].tofile(
                             crop_img_dir + img_name
                         )
