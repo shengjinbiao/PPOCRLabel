@@ -20,11 +20,13 @@ import datetime
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
 import shutil
 import copy
+import gc
 import uuid
 from pathlib import Path
 from functools import partial
@@ -32,7 +34,10 @@ from functools import partial
 import openpyxl
 import cv2
 import numpy as np
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None
 
 from PyQt5.QtCore import (
     QSize,
@@ -95,7 +100,8 @@ from pandas.io.sql import has_table
 sys.path.append(os.path.join(__dir__, ""))
 
 import paddle
-from paddleocr import PaddleOCR, PPStructureV3, TextRecognition, TextDetection
+PaddleOCR = PPStructureV3 = TextRecognition = TextDetection = None
+_PADDLEOCR_IMPORT_ERROR = None
 import libs.resources
 from libs.constants import (
     SETTING_ADVANCE_MODE,
@@ -182,15 +188,55 @@ import logging
 
 logger = logging.getLogger("PPOCRLabel")
 
+LEGACY_PROOFREAD_URL = "http://192.168.1.103:1234"
 DEFAULT_PROOFREAD_URL = os.getenv(
-    "PPOCRLABEL_PROOFREAD_URL", "http://192.168.1.103:1234"
+    "PPOCRLABEL_PROOFREAD_URL", "https://api.deepseek.com/chat/completions"
 )
-DEFAULT_PROOFREAD_STYLE = os.getenv("PPOCRLABEL_PROOFREAD_STYLE", "json").lower()
-DEFAULT_PROOFREAD_MODEL = os.getenv("PPOCRLABEL_PROOFREAD_MODEL", "")
-DEFAULT_PROOFREAD_API_KEY = os.getenv("PPOCRLABEL_PROOFREAD_API_KEY", "")
+DEFAULT_PROOFREAD_STYLE = os.getenv("PPOCRLABEL_PROOFREAD_STYLE", "openai").lower()
+DEFAULT_PROOFREAD_MODEL = os.getenv("PPOCRLABEL_PROOFREAD_MODEL", "deepseek-v4-flash")
+DEFAULT_PROOFREAD_API_KEY = os.getenv(
+    "PPOCRLABEL_PROOFREAD_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")
+)
 
 
 __appname__ = "PPOCRLabel"
+
+
+def configure_logging(level=None):
+    """Send PPOCRLabel logs to the launching terminal and a local log file."""
+    log_level_name = (level or os.environ.get("PPOCRLABEL_LOG_LEVEL") or "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logger.setLevel(log_level)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    has_stream = any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers)
+    if not has_stream:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(log_level)
+        logger.addHandler(stream_handler)
+
+    log_path = os.path.abspath(os.environ.get("PPOCRLABEL_LOG_FILE", "ppocrlabel.log"))
+    has_file = any(
+        isinstance(handler, logging.FileHandler)
+        and os.path.abspath(getattr(handler, "baseFilename", "")) == log_path
+        for handler in logger.handlers
+    )
+    if not has_file:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(log_level)
+        logger.addHandler(file_handler)
+
+    for handler in logger.handlers:
+        handler.setLevel(log_level)
+
+    logger.info("Logging initialized at %s; file=%s", logging.getLevelName(log_level), log_path)
 
 LABEL_COLORMAP = label_colormap()
 
@@ -349,7 +395,19 @@ class MainWindow(QMainWindow):
                 "yes",
                 "on",
             )
-        self.use_ppstructure = bool(stored_ppstructure)
+        self.hunyuan_engine = None
+        self.qwen_engine = None
+        self.use_hunyuan = bool(settings.get("use_hunyuan_gguf", False))
+        self.use_qwen = bool(settings.get("use_qwen_ocr_lmstudio", False))
+        if self.use_qwen:
+            self.use_hunyuan = False
+        self.hunyuan_layout_mode = settings.get("hunyuan_layout_mode", "auto")
+        if self.hunyuan_layout_mode not in {
+            "auto", "horizontal-single", "horizontal-two",
+            "vertical-single", "vertical-two",
+        }:
+            self.hunyuan_layout_mode = "auto"
+        self.use_ppstructure = bool(stored_ppstructure) and not self.use_hunyuan
         self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
         stored_two_col = settings.get(SETTING_TWO_COLUMN_LR, False)
         if isinstance(stored_two_col, str):
@@ -358,17 +416,24 @@ class MainWindow(QMainWindow):
         self.settings[SETTING_TWO_COLUMN_LR] = self.two_column_lr
         # Preload PP-Structure engine on startup when enabled to avoid double initialization later.
         self._ppstructure_engine = None
-        if self.use_ppstructure:
-            self._get_ppstructure_engine()
         stored_proofreader_endpoint = settings.get(SETTING_PROOFREAD_ENDPOINT)
         if proofread_url:
             self.proofreader_endpoint = proofread_url
             settings[SETTING_PROOFREAD_ENDPOINT] = proofread_url
+        elif stored_proofreader_endpoint == LEGACY_PROOFREAD_URL:
+            self.proofreader_endpoint = DEFAULT_PROOFREAD_URL
+            settings[SETTING_PROOFREAD_ENDPOINT] = self.proofreader_endpoint
         elif stored_proofreader_endpoint:
             self.proofreader_endpoint = stored_proofreader_endpoint
         else:
             self.proofreader_endpoint = DEFAULT_PROOFREAD_URL
         stored_proofreader_style = settings.get(SETTING_PROOFREAD_STYLE)
+        if (
+            proofread_style is None
+            and stored_proofreader_endpoint == LEGACY_PROOFREAD_URL
+            and stored_proofreader_style == "json"
+        ):
+            stored_proofreader_style = None
         chosen_style = proofread_style or stored_proofreader_style or DEFAULT_PROOFREAD_STYLE
         if not isinstance(chosen_style, str):
             chosen_style = "json"
@@ -378,20 +443,22 @@ class MainWindow(QMainWindow):
         self.proofreader_style = chosen_style
         settings[SETTING_PROOFREAD_STYLE] = self.proofreader_style
         stored_proofreader_model = settings.get(SETTING_PROOFREAD_MODEL, DEFAULT_PROOFREAD_MODEL)
+        if stored_proofreader_model in ("", "deepseek-chat"):
+            stored_proofreader_model = DEFAULT_PROOFREAD_MODEL
         if proofread_model is not None:
             self.proofreader_model = proofread_model
             settings[SETTING_PROOFREAD_MODEL] = proofread_model
         else:
             self.proofreader_model = stored_proofreader_model or DEFAULT_PROOFREAD_MODEL
             settings[SETTING_PROOFREAD_MODEL] = self.proofreader_model
-        stored_proofreader_api_key = settings.get(
-            SETTING_PROOFREAD_API_KEY, DEFAULT_PROOFREAD_API_KEY
-        )
+        stored_proofreader_api_key = settings.get(SETTING_PROOFREAD_API_KEY)
         if proofread_api_key is not None:
             self.proofreader_api_key = proofread_api_key
             settings[SETTING_PROOFREAD_API_KEY] = proofread_api_key
         else:
-            self.proofreader_api_key = stored_proofreader_api_key or ""
+            self.proofreader_api_key = (
+                stored_proofreader_api_key or DEFAULT_PROOFREAD_API_KEY
+            )
         self.proofreader_timeout = 45
 
         self.lexicon_manager = LexiconLanguageModel(
@@ -399,31 +466,7 @@ class MainWindow(QMainWindow):
             Path(__dir__) / "data" / "custom_corpus.txt",
         )
 
-        self._reload_ocr_backends()
-        rec_kwargs = {
-            "device": self.gpu,
-            "model_name": self._infer_model_name(
-                self.rec_model_dir, "PP-OCRv5_mobile_rec"
-            ),
-        }
-        if self.rec_model_dir:
-            rec_kwargs["model_dir"] = self.rec_model_dir
-        self.text_recognizer = TextRecognition(**rec_kwargs)
-        enable_candidate_extraction(self.text_recognizer, top_k=10)
-
-        det_kwargs = {
-            "device": self.gpu,
-            "model_name": self._infer_model_name(
-                self.det_model_dir, "PP-OCRv5_mobile_det"
-            ),
-        }
-        if self.det_model_dir:
-            det_kwargs["model_dir"] = self.det_model_dir
-        self.text_detector = TextDetection(**det_kwargs)
-
-        if os.path.exists("./data/paddle.png"):
-            self.ocr.predict("./data/paddle.png")
-            self.table_ocr.predict("./data/paddle.png")
+        self._models_loaded = False
 
         # For loading all image under a directory
         self.mImgList = []
@@ -566,6 +609,10 @@ class MainWindow(QMainWindow):
         self.tableRecButton = QToolButton()
         self.tableRecButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
+        self.ancientGroupButton = QToolButton()
+        self.ancientGroupButton.setIcon(newIcon("Auto", 30))
+        self.ancientGroupButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
         self.newButton = QToolButton()
         self.newButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.createpolyButton = QToolButton()
@@ -577,6 +624,8 @@ class MainWindow(QMainWindow):
         self.DelButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.ResortButton = QToolButton()
         self.ResortButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.ResortAllButton = QToolButton()
+        self.ResortAllButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         leftTopToolBox = QGridLayout()
         leftTopToolBox.addWidget(self.newButton, 0, 0, 1, 1)
@@ -586,6 +635,7 @@ class MainWindow(QMainWindow):
         leftTopToolBox.addWidget(self.manualProofButton, 1, 2, 1, 1)
         leftTopToolBox.addWidget(self.addLexiconButton, 2, 0, 1, 1)
         leftTopToolBox.addWidget(self.tableRecButton, 2, 1, 1, 2)
+        leftTopToolBox.addWidget(self.ancientGroupButton, 3, 0, 1, 3)
 
         leftTopToolBoxContainer = QWidget()
         leftTopToolBoxContainer.setLayout(leftTopToolBox)
@@ -611,6 +661,7 @@ class MainWindow(QMainWindow):
 
         # Create and add a widget for showing current label items
         self.labelList = EditInList()
+        self.labelList.setWordWrap(True)
         self.charCandidateController = CharacterCandidateController(
             self.labelList,
             lambda item: self._shape_from_label_item(item),
@@ -690,6 +741,7 @@ class MainWindow(QMainWindow):
         leftbtmtoolbox.addWidget(self.SaveButton)
         leftbtmtoolbox.addWidget(self.DelButton)
         leftbtmtoolbox.addWidget(self.ResortButton)
+        leftbtmtoolbox.addWidget(self.ResortAllButton)
         self.toggleBoxPanelButton = QToolButton()
         self.toggleBoxPanelButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.toggleBoxPanelButton.clicked.connect(self.toggle_box_panel_visibility)
@@ -817,6 +869,11 @@ class MainWindow(QMainWindow):
             "Ctrl+Shift+U",
             "file",
             get_str("importPdfDetail"),
+        )
+
+        import_djvu = action(
+            get_str("importDjvu"), self.importDjvuDialog, None, "file",
+            get_str("importDjvuDetail"),
         )
 
         open_dataset_dir = action(
@@ -1050,6 +1107,13 @@ class MainWindow(QMainWindow):
             "next",
             get_str("customModelActionDetail"),
         )
+        unloadModelsAction = action(
+            get_str("unloadModels"),
+            self.unload_ocr_models,
+            "",
+            "undo",
+            get_str("unloadModelsDetail"),
+        )
 
         reRec = action(
             get_str("reRecognition"),
@@ -1057,6 +1121,38 @@ class MainWindow(QMainWindow):
             "Ctrl+Shift+R",
             "reRec",
             get_str("reRecognition"),
+            enabled=False,
+        )
+        splitCharBoxesAuto = action(
+            "切成单字框（自动）",
+            partial(self.splitCurrentBoxesToCharacters, "auto"),
+            "",
+            "resort",
+            "将当前图片已有标注框按文字切成一字一框，并刷新列表",
+            enabled=False,
+        )
+        splitCharBoxesVertical = action(
+            "切成单字框（竖排）",
+            partial(self.splitCurrentBoxesToCharacters, "vertical"),
+            "",
+            "resort",
+            "按竖排方向将当前图片已有标注框切成一字一框",
+            enabled=False,
+        )
+        splitCharBoxesHorizontal = action(
+            "切成单字框（横排）",
+            partial(self.splitCurrentBoxesToCharacters, "horizontal"),
+            "",
+            "resort",
+            "按横排方向将当前图片已有标注框切成一字一框",
+            enabled=False,
+        )
+        findAncientGroups = action(
+            "自动查找古文字聚合框",
+            self.findAncientCharacterGroups,
+            "",
+            "Auto",
+            "根据已有文字框中的编号，找出相邻的大字形并新增候选聚合框；不会删除或改动原有框。",
             enabled=False,
         )
 
@@ -1148,6 +1244,14 @@ class MainWindow(QMainWindow):
             get_str("exportFullTextDetail"),
             enabled=False,
         )
+        exportCurrentText = action(
+            get_str("exportCurrentText"),
+            self.exportCurrentText,
+            "",
+            "save",
+            get_str("exportCurrentTextDetail"),
+            enabled=False,
+        )
 
         saveLabel = action(
             get_str("saveLabel"),
@@ -1236,6 +1340,14 @@ class MainWindow(QMainWindow):
             get_str("resortpositiondetail"),
             enabled=True,
         )
+        resortAll = action(
+            get_str("resortAllPositions"),
+            self.resortAllBoxPositions,
+            "",
+            "resort",
+            get_str("resortAllPositionsDetail"),
+            enabled=True,
+        )
 
         self.editButton.setDefaultAction(edit)
         self.newButton.setDefaultAction(create)
@@ -1252,7 +1364,9 @@ class MainWindow(QMainWindow):
         self.manualProofButton.setDefaultAction(manualProofread)
         self.addLexiconButton.setDefaultAction(addToLexicon)
         self.tableRecButton.setDefaultAction(tableRec)
+        self.ancientGroupButton.setDefaultAction(findAncientGroups)
         self.ResortButton.setDefaultAction(resort)
+        self.ResortAllButton.setDefaultAction(resortAll)
         # self.preButton.setDefaultAction(openPrevImg)
         # self.nextButton.setDefaultAction(openNextImg)
 
@@ -1350,6 +1464,43 @@ class MainWindow(QMainWindow):
             checkable=True,
         )
         self.ppstructureAction.setChecked(self.use_ppstructure)
+        self.hunyuanAction = action(
+            get_str("useHunyuan"), self.toggleHunyuan,
+            tip=get_str("useHunyuanDetail"), checkable=True,
+        )
+        self.hunyuanAction.setChecked(self.use_hunyuan)
+        self.qwenAction = action(
+            "使用 Qwen OCR",
+            self.toggleQwen,
+            tip="使用 PPOCRLabel 自己启动的 Qwen 2 VL 7B OCR；任务结束后自动卸载。",
+            checkable=True,
+        )
+        self.qwenAction.setChecked(self.use_qwen)
+        self.hunyuanLayoutMenu = QMenu("混元 / Qwen OCR 版式", self)
+        self.hunyuanLayoutActionGroup = QActionGroup(self)
+        self.hunyuanLayoutActionGroup.setExclusive(True)
+        self.hunyuanLayoutActions = {}
+        for mode, label, tip in (
+            ("auto", "自动判断", "根据中缝和当前阅读方向选择单栏或双栏。"),
+            ("horizontal-single", "横排单栏", "整栏送入 Hunyuan，按自上而下读取。"),
+            ("horizontal-two", "横排双栏（左→右）", "左右栏分别送入 Hunyuan，再按左栏、右栏合并。"),
+            ("vertical-single", "竖排单栏", "整栏送入 Hunyuan，按从右到左、每列从上到下读取。"),
+            ("vertical-two", "竖排双栏（右→左）", "左右栏分别送入 Hunyuan，再按右栏、左栏合并。"),
+        ):
+            layout_action = action(
+                label,
+                partial(self.setHunyuanLayoutMode, mode),
+                tip=tip,
+                checkable=True,
+            )
+            layout_action.setChecked(mode == self.hunyuan_layout_mode)
+            self.hunyuanLayoutActionGroup.addAction(layout_action)
+            self.hunyuanLayoutMenu.addAction(layout_action)
+            self.hunyuanLayoutActions[mode] = layout_action
+        self.autoRecognitionMenu.addSeparator()
+        self.autoRecognitionMenu.addAction(self.hunyuanAction)
+        self.autoRecognitionMenu.addAction(self.qwenAction)
+        self.autoRecognitionMenu.addMenu(self.hunyuanLayoutMenu)
         self.twoColumnLRAction = action(
             get_str("twoColumnLR"),
             self.toggleTwoColumnLR,
@@ -1387,6 +1538,7 @@ class MainWindow(QMainWindow):
             copy=copy,
             saveRec=saveRec,
             exportFullText=exportFullText,
+            exportCurrentText=exportCurrentText,
             singleRere=singleRere,
             autoProofread=autoProofread,
             manualProofread=manualProofread,
@@ -1396,11 +1548,18 @@ class MainWindow(QMainWindow):
             AutoRecCurrent=AutoRecCurrent,
             layoutFirst=self.layoutAnalysisAction,
             usePPStructure=self.ppstructureAction,
+            useQwen=self.qwenAction,
             twoColumnLR=self.twoColumnLRAction,
             reRec=reRec,
+            resortAll=resortAll,
+            splitCharBoxesAuto=splitCharBoxesAuto,
+            splitCharBoxesVertical=splitCharBoxesVertical,
+            splitCharBoxesHorizontal=splitCharBoxesHorizontal,
+            findAncientGroups=findAncientGroups,
             cellreRec=cellreRec,
             train=trainAction,
             customModel=customModelAction,
+            unloadModels=unloadModelsAction,
             createMode=createMode,
             editMode=editMode,
             shapeLineColor=shapeLineColor,
@@ -1418,6 +1577,7 @@ class MainWindow(QMainWindow):
             undoLastPoint=undoLastPoint,
             open_dataset_dir=open_dataset_dir,
             importPdf=import_pdf,
+            importDjvu=import_djvu,
             rotateLeft=rotateLeft,
             rotateRight=rotateRight,
             lock=lock,
@@ -1427,6 +1587,7 @@ class MainWindow(QMainWindow):
             fileMenuActions=(
                 opendir,
                 import_pdf,
+                import_djvu,
                 open_dataset_dir,
                 saveLabel,
                 exportJSON,
@@ -1480,7 +1641,17 @@ class MainWindow(QMainWindow):
                 shapeLineColor,
                 shapeFillColor,
             ),
-            onLoadActive=(create, createpoly, createMode, editMode),
+            onLoadActive=(
+                create,
+                createpoly,
+                createMode,
+                editMode,
+                exportCurrentText,
+                splitCharBoxesAuto,
+                splitCharBoxesVertical,
+                splitCharBoxesHorizontal,
+                findAncientGroups,
+            ),
             onShapesPresent=(hideAll, showAll),
         )
 
@@ -1545,11 +1716,13 @@ class MainWindow(QMainWindow):
             (
                 opendir,
                 import_pdf,
+                import_djvu,
                 open_dataset_dir,
                 None,
                 saveLabel,
                 saveRec,
                 exportFullText,
+                exportCurrentText,
                 exportJSON,
                 self.autoSaveOption,
                 self.autoReRecognitionOption,
@@ -1587,6 +1760,11 @@ class MainWindow(QMainWindow):
                  AutoRec,
                  AutoRecCurrent,
                  reRec,
+                 splitCharBoxesAuto,
+                 splitCharBoxesVertical,
+                 splitCharBoxesHorizontal,
+                 findAncientGroups,
+                 None,
                  autoProofread,
                  manualProofread,
                  addToLexicon,
@@ -1594,11 +1772,14 @@ class MainWindow(QMainWindow):
                 cellreRec,
                 trainAction,
                 customModelAction,
+                unloadModelsAction,
                 self.ppstructureAction,
+                self.hunyuanAction,
                 self.twoColumnLRAction,
                 self.readingModeMenu,
                 self.textLayoutMenu,
                 self.layoutAnalysisAction,
+                resortAll,
                 alcm,
                 None,
                 help,
@@ -1699,12 +1880,25 @@ class MainWindow(QMainWindow):
         # selected shape color
         self.selected_shape_color = selected_shape_color
 
+    def _device_arg(self):
+        if isinstance(self.gpu, str):
+            value = self.gpu.lower()
+            if value in ("gpu", "cuda"):
+                return "gpu:0"
+            if value in ("cpu",):
+                return "cpu"
+            return self.gpu
+        return "gpu:0" if self.gpu else "cpu"
+
+    def _use_gpu(self):
+        return self._device_arg().startswith("gpu")
+
     def _paddleocr_params(self, lang=None):
         params = {
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": self.use_vertical_text,
-            "device": self.gpu,
+            "device": self._device_arg(),
             "lang": lang or self.lang,
             "enable_mkldnn": False,
         }
@@ -1734,12 +1928,116 @@ class MainWindow(QMainWindow):
             use_chart_recognition=False,
             use_region_detection=False,
             use_textline_orientation=self.use_vertical_text,
-            device=self.gpu,
+            device=self._device_arg(),
             lang=lang or self.lang,
         )
         if self.cls_model_dir is not None:
             kwargs["textline_orientation_model_dir"] = self.cls_model_dir
         return PPStructureV3(**kwargs)
+
+    def _ensure_paddleocr_imported(self):
+        """Load PaddleOCR only when an OCR operation actually needs it."""
+        global PaddleOCR, PPStructureV3, TextRecognition, TextDetection
+        global _PADDLEOCR_IMPORT_ERROR
+        if _PADDLEOCR_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "PaddleOCR 依赖加载失败，请检查 Paddle/PyTorch 安装：%s"
+                % _PADDLEOCR_IMPORT_ERROR
+            )
+        if PaddleOCR is None:
+            try:
+                from paddleocr import (
+                    PaddleOCR as _PaddleOCR,
+                    PPStructureV3 as _PPStructureV3,
+                    TextRecognition as _TextRecognition,
+                    TextDetection as _TextDetection,
+                )
+                PaddleOCR = _PaddleOCR
+                PPStructureV3 = _PPStructureV3
+                TextRecognition = _TextRecognition
+                TextDetection = _TextDetection
+            except Exception as exc:
+                _PADDLEOCR_IMPORT_ERROR = exc
+                raise RuntimeError(
+                    "PaddleOCR 依赖加载失败，请检查 Paddle/PyTorch 安装：%s" % exc
+                ) from exc
+
+    def _load_ocr_models(self, warmup=False):
+        """Load the OCR engines, allowing them to be released during proofreading."""
+        self._ensure_paddleocr_imported()
+        self._reload_ocr_backends()
+        rec_kwargs = {
+            "device": self._device_arg(),
+            "model_name": self._infer_model_name(
+                self.rec_model_dir, "PP-OCRv5_mobile_rec"
+            ),
+        }
+        if self.rec_model_dir:
+            rec_kwargs["model_dir"] = self.rec_model_dir
+        self.text_recognizer = TextRecognition(**rec_kwargs)
+        enable_candidate_extraction(self.text_recognizer, top_k=10)
+
+        det_kwargs = {
+            "device": self._device_arg(),
+            "model_name": self._infer_model_name(
+                self.det_model_dir, "PP-OCRv5_mobile_det"
+            ),
+        }
+        if self.det_model_dir:
+            det_kwargs["model_dir"] = self.det_model_dir
+        self.text_detector = TextDetection(**det_kwargs)
+        self._models_loaded = True
+
+        if warmup and os.path.exists("./data/paddle.png"):
+            self.ocr.predict("./data/paddle.png")
+            self.table_ocr.predict("./data/paddle.png")
+
+    def _ensure_ocr_models_loaded(self):
+        if self.hunyuan_engine is not None:
+            self.hunyuan_engine.stop()
+        if not getattr(self, "_models_loaded", False):
+            self.statusBar().showMessage(self.get_str("loadingModels"))
+            self._load_ocr_models()
+
+    def _reload_ocr_models_if_loaded(self, lang=None):
+        """Apply OCR setting changes without loading models during idle startup."""
+        if lang is not None:
+            self.lang = lang
+        if not getattr(self, "_models_loaded", False):
+            return
+        self.unload_ocr_models()
+        self._load_ocr_models()
+
+    def unload_ocr_models(self):
+        """Release Paddle/PaddleX model objects and GPU allocator cache."""
+        dialog = getattr(self, "autoDialog", None)
+        worker = getattr(dialog, "thread_1", None) if dialog else None
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(self, "Warning", self.get_str("modelsBusy"))
+            return
+        if self.hunyuan_engine is not None:
+            self.hunyuan_engine.stop()
+        if dialog is not None:
+            dialog.ocr = None
+            if worker is not None:
+                worker.ocr = None
+        for name in (
+            "ocr",
+            "table_ocr",
+            "text_recognizer",
+            "text_detector",
+            "_ppstructure_engine",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+        self._models_loaded = False
+        gc.collect()
+        try:
+            if paddle.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
+        except Exception:
+            logger.debug("Unable to empty Paddle CUDA cache", exc_info=True)
+        self.statusBar().showMessage(self.get_str("modelsUnloaded"))
 
     def _reload_ocr_backends(self, lang=None):
         if lang is not None:
@@ -2191,6 +2489,7 @@ class MainWindow(QMainWindow):
         shape.paintIdx = self.displayIndexOption.isChecked()
 
         item = HashableQListWidgetItem(shape.label)
+        item.setToolTip(shape.label)
         item.setData(Qt.UserRole, shape)
         # current difficult checkbox is disable
         # item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -2366,6 +2665,9 @@ class MainWindow(QMainWindow):
     def _ensure_shape_candidates(self, shape):
         if getattr(shape, "char_candidates", None):
             return True
+        # OCR models are loaded lazily at startup.  Candidate lookup is also
+        # an OCR operation, so make sure the recognizer exists before using it.
+        self._ensure_ocr_models_loaded()
         if not self.filePath or not os.path.exists(self.filePath):
             return False
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -2467,6 +2769,51 @@ class MainWindow(QMainWindow):
         # Mode is Auto means that labels will be loaded from self.result_dic totally, which is the output of ocr model
         annotationFilePath = annotationFilePath
 
+        def current_image_width():
+            try:
+                if self.filePath:
+                    img = cv2.imdecode(
+                        np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR
+                    )
+                    if img is not None:
+                        return img.shape[1]
+            except Exception:
+                pass
+            try:
+                if self.image:
+                    return self.image.width()
+            except Exception:
+                pass
+            return None
+
+        def sort_auto_results(results):
+            if not results:
+                return results
+            if not (
+                getattr(self, "layout_first", False)
+                or getattr(self, "two_column_lr", False)
+                or getattr(self, "reading_mode", "horizontal") == "vertical"
+            ):
+                return results
+            if getattr(self, "two_column_lr", False):
+                return self.sort_ocr_result_entries(results)
+            if getattr(self, "reading_mode", "horizontal") == "vertical":
+                return self.sort_ocr_result_entries(results)
+            width = current_image_width()
+            if not width:
+                return results
+            try:
+                indices = list(range(len(results)))
+                polys = [res[0] for res in results]
+                scores = [0.0 for _ in results]
+                _, sorted_indices, _ = self.reorder_ocr_result_by_layout(
+                    polys, indices, scores, width
+                )
+                return [results[int(idx)] for idx in sorted_indices]
+            except Exception as exc:
+                logger.warning("Auto result sorting failed: %s", exc)
+                return results
+
         def format_shape(s):
             # print('s in saveLabels is ',s)
             return dict(
@@ -2482,6 +2829,7 @@ class MainWindow(QMainWindow):
 
         if mode == "Auto":
             shapes = []
+            self.result_dic = sort_auto_results(self.result_dic)
         else:
             shapes = [
                 format_shape(shape)
@@ -2651,7 +2999,10 @@ class MainWindow(QMainWindow):
             self._update_label_item_style(shape)
             # shape.line_color = generateColorByText(shape.label)
             self.setDirty()
-        elif not ((item.checkState() == Qt.Unchecked) ^ (not shape.difficult)):
+        elif (
+            item.flags() & Qt.ItemIsUserCheckable
+            and not ((item.checkState() == Qt.Unchecked) ^ (not shape.difficult))
+        ):
             shape.difficult = True if item.checkState() == Qt.Unchecked else False
             self.setDirty()
         else:  # User probably changed item visibility
@@ -2750,12 +3101,8 @@ class MainWindow(QMainWindow):
         shape.vertex_fill_color = QColor(r, g, b)
         shape.hvertex_fill_color = QColor(255, 255, 255)
         shape.fill_color = QColor(r, g, b, 32)
-        shape.select_line_color = QColor(
-            self.selected_shape_color[0],
-            self.selected_shape_color[1],
-            self.selected_shape_color[2],
-        )
-        shape.select_fill_color = QColor(r, g, b, 32)
+        shape.select_line_color = QColor(0, 96, 255, 255)
+        shape.select_fill_color = QColor(255, 191, 0, 115)
 
     def _get_rgb_by_label(self, label, kie_mode):
         shift_auto_shape_color = 2  # use for random color
@@ -3082,6 +3429,8 @@ class MainWindow(QMainWindow):
         if not self.mayContinue():
             event.ignore()
         else:
+            if self.hunyuan_engine is not None:
+                self.hunyuan_engine.stop()
             settings = self.settings
             # If it loads images from dir, don't load it at the beginning
             if self.dirname is None:
@@ -3111,7 +3460,7 @@ class MainWindow(QMainWindow):
             settings[SETTING_DRAW_SQUARE] = self.drawSquaresOption.isChecked()
             settings.save()
             try:
-                self.saveLabelFile()
+                self.saveLabelFile(mode="Auto")
             except Exception:
                 pass
 
@@ -3183,6 +3532,74 @@ class MainWindow(QMainWindow):
             defaultOpenDirPath = (
                 os.path.dirname(self.filePath) if self.filePath else "."
             )
+
+    def importDjvuDialog(self):
+        from libs.djvu_import import (
+            ImportCancelled, convert_documents, find_tools,
+        )
+
+        if not self.mayContinue():
+            return
+        try:
+            tools = find_tools()
+        except FileNotFoundError:
+            QMessageBox.warning(self, self.get_str("importDjvu"),
+                                self.get_str("djvuToolsMissing"))
+            return
+        start_dir = self.lastOpenDir if self.lastOpenDir and os.path.exists(self.lastOpenDir) else "."
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, self.get_str("selectDjvu"), start_dir,
+            "DjVu Files (*.djvu *.djv *.DJVU *.DJV)",
+        )
+        if not paths:
+            return
+        output_dir = QFileDialog.getExistingDirectory(
+            self, self.get_str("selectPdfOutputDir"), start_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
+        )
+        if not output_dir:
+            return
+        progress = QProgressDialog(self.get_str("importDjvuDetail"),
+                                   self.get_str("cancel"), 0, 0, self)
+        progress.setWindowTitle(self.get_str("importDjvu"))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        def tick():
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                raise ImportCancelled()
+
+        def update(name, done, total):
+            progress.setMaximum(total)
+            progress.setValue(done)
+            progress.setLabelText(self.get_str("djvuImportProgress").format(name, done, total))
+            tick()
+
+        converted = []
+        message = None
+        failed = False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            converted = convert_documents(paths, output_dir, tools, tick, update)
+        except ImportCancelled:
+            message = self.get_str("djvuImportCancelled")
+        except Exception as exc:
+            message = self.get_str("djvuImportFailed").format(str(exc))
+            failed = True
+        finally:
+            progress.close()
+            QApplication.restoreOverrideCursor()
+        if message:
+            show = QMessageBox.warning if failed else QMessageBox.information
+            show(self, self.get_str("importDjvu"), message)
+        if converted:
+            self.lastOpenDir = output_dir
+            self.importDirImages(output_dir)
+            QMessageBox.information(self, self.get_str("info"),
+                                    self.get_str("pdfImportSuccess").format(len(converted), output_dir))
 
     def importPdfDialog(self):
         if not self.mayContinue():
@@ -3404,6 +3821,7 @@ class MainWindow(QMainWindow):
         self.actions.addPageToLexicon.setEnabled(True)
         self.actions.addToLexicon.setEnabled(True)
         self.actions.tableRec.setEnabled(True)
+        self.actions.findAncientGroups.setEnabled(True)
         self.actions.open_dataset_dir.setEnabled(True)
         self.actions.rotateLeft.setEnabled(True)
         self.actions.rotateRight.setEnabled(True)
@@ -3521,6 +3939,7 @@ class MainWindow(QMainWindow):
                     self.openNextImg()
                 self.actions.saveRec.setEnabled(True)
                 self.actions.exportFullText.setEnabled(True)
+                self.actions.exportCurrentText.setEnabled(True)
                 self.actions.saveLabel.setEnabled(True)
                 self.actions.exportJSON.setEnabled(True)
 
@@ -3529,6 +3948,14 @@ class MainWindow(QMainWindow):
                 self.setClean()
                 self.statusBar().showMessage("Saved to  %s" % annotationFilePath)
                 self.statusBar().show()
+                self.fileStatedict[self.getImglabelidx(self.filePath)] = 1
+                try:
+                    currIndex = self.mImgList.index(self.filePath)
+                    item = self.fileListWidget.item(currIndex)
+                    if item is not None:
+                        item.setIcon(newIcon("done"))
+                except Exception:
+                    logger.debug("Unable to update file list icon after auto save", exc_info=True)
 
     def closeFile(self, _value=False):
         if not self.mayContinue():
@@ -3797,10 +4224,12 @@ class MainWindow(QMainWindow):
         return file_path_split[0] + "/" + file_path_split[1]
 
     def _get_labels_for_image(self, filePath):
-        """Return labels for an image, tolerant to key formats and cache."""
+        """Return labels, preferring manually saved labels over OCR cache."""
         idx = self.getImglabelidx(filePath)
         fallback = os.path.basename(filePath)
-        for source in (getattr(self, "Cachelabel", {}), getattr(self, "PPlabel", {})):
+        # Cache.cach contains the original automatic OCR result. Manual edits
+        # are written to Label.txt/PPlabel and must win when both exist.
+        for source in (getattr(self, "PPlabel", {}), getattr(self, "Cachelabel", {})):
             if idx in source:
                 return source.get(idx)
             if fallback in source:
@@ -3817,6 +4246,8 @@ class MainWindow(QMainWindow):
 
     def autoRecognition(self):
         assert self.mImgList is not None
+        if not self.use_hunyuan and not self.use_qwen:
+            self._ensure_ocr_models_loaded()
         logger.info("Using model from %s", self.model)
 
         start_index = self.currIndex
@@ -3827,6 +4258,8 @@ class MainWindow(QMainWindow):
 
     def autoRecognitionCurrent(self):
         assert self.mImgList is not None
+        if not self.use_hunyuan and not self.use_qwen:
+            self._ensure_ocr_models_loaded()
         if not self.mImgList:
             return
         logger.info("Auto recognition limited to current page")
@@ -3871,18 +4304,44 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if self.use_hunyuan:
+            from libs.hunyuan_ocr import HunyuanOCR
+            if self.hunyuan_engine is None:
+                self.hunyuan_engine = HunyuanOCR()
+            try:
+                self.hunyuan_engine.check_files()
+            except Exception as exc:
+                QMessageBox.warning(self, "HunyuanOCR", str(exc))
+                return
+            self.unload_ocr_models()
+        elif self.use_qwen:
+            from libs.qwen_ocr import QwenOCR
+
+            if self.qwen_engine is None:
+                self.qwen_engine = QwenOCR()
+            try:
+                self.qwen_engine.check_files()
+            except Exception as exc:
+                QMessageBox.warning(self, "Qwen OCR", str(exc))
+                return
+            self.unload_ocr_models()
         self.autoDialog = AutoDialog(
             parent=self,
-            ocr=self.ocr,
+            ocr=None if (self.use_hunyuan or self.use_qwen) else self.ocr,
             image_list=uncheckedList,
             len_bar=len(uncheckedList),
-            model="ppstructure" if self.use_ppstructure else "paddle",
+            model=(
+                "hunyuan" if self.use_hunyuan else
+                "qwen" if self.use_qwen else
+                ("ppstructure" if self.use_ppstructure else "paddle")
+            ),
         )
         self.autoDialog.popUp()
         self.haveAutoReced = True
         self.filePath = self.mImgList[self.currIndex]
         self.loadFile(self.filePath, isAdjustScale=False)
         self.saveCacheLabel()
+        self.savePPlabel(mode="Auto")
 
         self.init_key_list(self.Cachelabel)
 
@@ -4042,7 +4501,7 @@ class MainWindow(QMainWindow):
             "-c",
             config_path,
             "-o",
-            f"Global.use_gpu={'true' if self.gpu == 'gpu' else 'false'}",
+            f"Global.use_gpu={'true' if self._use_gpu() else 'false'}",
             f"Global.save_model_dir={norm(output_dir)}",
             f"Train.loader.batch_size_per_card={batch_size}",
             f"Global.epoch_num={epochs}",
@@ -4253,7 +4712,7 @@ class MainWindow(QMainWindow):
             if not extra_dir:
                 self.settings[SETTING_MODEL_SEARCH_DIR] = parent_dir
             self.settings.save()
-            self._reload_ocr_backends()
+            self._reload_ocr_models_if_loaded()
             self._show_export_success(inference_dir)
         except Exception as exc:
             logger.exception("Failed to apply exported detection model: %s", exc)
@@ -4336,7 +4795,7 @@ class MainWindow(QMainWindow):
         self.use_vertical_text = self.text_layout_mode == "vertical"
         self.settings[SETTING_TEXT_LAYOUT_MODE] = self.text_layout_mode
         self.settings.save()
-        self._reload_ocr_backends()
+        self._reload_ocr_models_if_loaded()
         layout_label = (
             self.stringBundle.getString("textLayoutVertical")
             if self.use_vertical_text
@@ -4381,7 +4840,71 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(message, 3000)
 
+    def toggleHunyuan(self, checked):
+        self.use_hunyuan = bool(checked)
+        self.settings["use_hunyuan_gguf"] = self.use_hunyuan
+        if checked:
+            self.qwenAction.setChecked(False)
+            self.use_qwen = False
+            self.settings["use_qwen_ocr_lmstudio"] = False
+            if self.qwen_engine is not None:
+                self.qwen_engine.stop()
+            self.ppstructureAction.setChecked(False)
+            self.use_ppstructure = False
+            self.settings[SETTING_USE_PPSTRUCTURE] = False
+            self.unload_ocr_models()
+        elif self.hunyuan_engine is not None:
+            self.hunyuan_engine.stop()
+        self.settings.save()
+        self.statusBar().showMessage(self.get_str("hunyuanSelected" if checked else "hunyuanDeselected"))
+
+    def toggleQwen(self, checked):
+        self.use_qwen = bool(checked)
+        self.settings["use_qwen_ocr_lmstudio"] = self.use_qwen
+        if checked:
+            self.hunyuanAction.setChecked(False)
+            self.use_hunyuan = False
+            self.settings["use_hunyuan_gguf"] = False
+            if self.hunyuan_engine is not None:
+                self.hunyuan_engine.stop()
+            self.ppstructureAction.setChecked(False)
+            self.use_ppstructure = False
+            self.settings[SETTING_USE_PPSTRUCTURE] = False
+            self.unload_ocr_models()
+        elif self.qwen_engine is not None:
+            self.qwen_engine.stop()
+        self.settings.save()
+        self.statusBar().showMessage(
+            "已选择 Qwen OCR" if checked else "已取消 Qwen OCR"
+        )
+
+    def setHunyuanLayoutMode(self, mode, _checked=False):
+        valid_modes = {
+            "auto", "horizontal-single", "horizontal-two",
+            "vertical-single", "vertical-two",
+        }
+        if mode not in valid_modes:
+            return
+        self.hunyuan_layout_mode = mode
+        self.settings["hunyuan_layout_mode"] = mode
+        self.settings.save()
+        action = getattr(self, "hunyuanLayoutActions", {}).get(mode)
+        if action:
+            action.setChecked(True)
+        self.statusBar().showMessage(f"HunyuanOCR 版式：{mode}", 3000)
+
     def togglePPStructure(self, checked):
+        if checked:
+            self.hunyuanAction.setChecked(False)
+            self.use_hunyuan = False
+            self.settings["use_hunyuan_gguf"] = False
+            self.qwenAction.setChecked(False)
+            self.use_qwen = False
+            self.settings["use_qwen_ocr_lmstudio"] = False
+            if self.hunyuan_engine is not None:
+                self.hunyuan_engine.stop()
+            if self.qwen_engine is not None:
+                self.qwen_engine.stop()
         self.use_ppstructure = bool(checked)
         self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
         self.settings.save()
@@ -4402,6 +4925,343 @@ class MainWindow(QMainWindow):
             else self.get_str("twoColumnLRStatusOff")
         )
         self.statusBar().showMessage(message, 3000)
+
+    def sort_ocr_result_entries(self, results):
+        if not results:
+            return results
+        if not (
+            getattr(self, "two_column_lr", False)
+            or getattr(self, "layout_first", False)
+            or getattr(self, "reading_mode", "horizontal") == "vertical"
+        ):
+            return results
+        rectangles_by_idx = {}
+        rects = []
+        for idx, res in enumerate(results):
+            try:
+                arr = np.array(res[0], dtype=float)
+                xs = arr[:, 0]
+                ys = arr[:, 1]
+                rect = res[0]
+                rect_list = rect.tolist() if hasattr(rect, "tolist") else rect
+                rectangles_by_idx[idx] = rect_list
+                rects.append(
+                    {
+                        "idx": idx,
+                        "center_x": float((xs.min() + xs.max()) / 2.0),
+                        "center_y": float((ys.min() + ys.max()) / 2.0),
+                    }
+                )
+            except Exception:
+                continue
+        if len(rects) < 2:
+            return results
+
+        if (
+            getattr(self, "reading_mode", "horizontal") == "vertical"
+            and not getattr(self, "layout_first", False)
+            and not getattr(self, "two_column_lr", False)
+        ):
+            sortable_indices = [r["idx"] for r in rects]
+            rectangles = [rectangles_by_idx[idx] for idx in sortable_indices]
+            sorted_rectangles = self.sort_rectangles(rectangles, row_height_threshold=0.5)
+            index_map = []
+            used = set()
+            for sorted_rect in sorted_rectangles:
+                for old_idx, rect in enumerate(rectangles):
+                    if old_idx not in used and rect == sorted_rect:
+                        index_map.append(sortable_indices[old_idx])
+                        used.add(old_idx)
+                        break
+            ordered = set(index_map)
+            missing = [idx for idx in range(len(results)) if idx not in ordered]
+            return [results[idx] for idx in index_map + missing]
+
+        left_center = min(r["center_x"] for r in rects)
+        right_center = max(r["center_x"] for r in rects)
+        if right_center - left_center < 1:
+            ordered = sorted(rects, key=lambda r: (r["center_y"], r["center_x"]))
+            return [results[r["idx"]] for r in ordered]
+
+        for _ in range(8):
+            left = []
+            right = []
+            for r in rects:
+                if abs(r["center_x"] - left_center) <= abs(
+                    r["center_x"] - right_center
+                ):
+                    left.append(r)
+                else:
+                    right.append(r)
+            if not left or not right:
+                break
+            new_left = sum(r["center_x"] for r in left) / len(left)
+            new_right = sum(r["center_x"] for r in right) / len(right)
+            if new_left == left_center and new_right == right_center:
+                break
+            left_center, right_center = new_left, new_right
+
+        split = (left_center + right_center) / 2.0
+        left = [r for r in rects if r["center_x"] < split]
+        right = [r for r in rects if r["center_x"] >= split]
+        if not left or not right:
+            ordered = sorted(rects, key=lambda r: (r["center_y"], r["center_x"]))
+        else:
+            left.sort(key=lambda r: (r["center_y"], r["center_x"]))
+            right.sort(key=lambda r: (r["center_y"], r["center_x"]))
+            if getattr(self, "two_column_lr", False):
+                ordered = left + right
+            elif getattr(self, "reading_mode", "horizontal") == "vertical":
+                ordered = right + left
+            else:
+                ordered = left + right
+
+        ordered_indices = [r["idx"] for r in ordered]
+        missing = [idx for idx in range(len(results)) if idx not in ordered_indices]
+        return [results[idx] for idx in ordered_indices + missing]
+
+    def refine_ocr_result_entries_by_crops(self, img, results):
+        if img is None or not results:
+            return results
+        refined = []
+        for res in results:
+            try:
+                box = res[0]
+                if len(box) > 4:
+                    box = self.gen_quad_from_poly(np.array(box))
+                padded = boxPad(box, img.shape, 2)
+                crop = get_rotate_crop_image(img, np.array(padded, np.float32))
+                if crop is None:
+                    refined.append(res)
+                    continue
+                rec = self._decode_with_lexicon(self.text_recognizer.predict(crop)[0])
+                text = rec.get("rec_text", "")
+                score = float(rec.get("rec_score") or 0.0)
+                if text:
+                    item = [res[0], (text, score)]
+                    if len(res) > 2:
+                        item.extend(res[2:])
+                    refined.append(item)
+                else:
+                    refined.append(res)
+            except Exception as exc:
+                logger.warning("Crop refinement failed: %s", exc)
+                refined.append(res)
+        return refined
+
+    def _find_two_column_gutter(self, img):
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        if h <= 32 or w <= 32:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        y0 = max(0, int(h * 0.06))
+        y1 = min(h, int(h * 0.96))
+        x0 = max(0, int(w * 0.35))
+        x1 = min(w, int(w * 0.65))
+        if y1 <= y0 or x1 <= x0:
+            return w // 2
+        body = gray[y0:y1, x0:x1]
+        ink = (body < 210).mean(axis=0)
+        radius = max(2, w // 350)
+        kernel = np.ones(radius * 2 + 1, dtype=float) / float(radius * 2 + 1)
+        smooth = np.convolve(ink, kernel, mode="same")
+        return x0 + int(np.argmin(smooth))
+
+    def predict_ocr_by_two_column_crops(self, ocr, img):
+        """Run OCR on left/right page halves, then remap boxes to page coordinates."""
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        split = self._find_two_column_gutter(img)
+        if split is None or split <= w * 0.25 or split >= w * 0.75:
+            split = w // 2
+
+        gap = max(2, w // 300)
+        regions = [
+            (0, max(1, split - gap)),
+            (min(w - 1, split + gap), w),
+        ]
+        rec_polys = []
+        rec_texts = []
+        rec_scores = []
+        for x_start, x_end in regions:
+            if x_end - x_start <= 32:
+                continue
+            crop = img[:, x_start:x_end]
+            result = ocr.predict(crop)[0]
+            for poly, text, score in zip(
+                result["rec_polys"],
+                result["rec_texts"],
+                result["rec_scores"],
+            ):
+                arr = np.array(poly).copy()
+                arr[:, 0] += x_start
+                rec_polys.append(arr)
+                rec_texts.append(text)
+                rec_scores.append(score)
+        if not rec_polys:
+            return None
+        rec_polys, rec_texts, rec_scores = self.merge_nested_dictionary_rows(
+            rec_polys, rec_texts, rec_scores, w
+        )
+        return rec_polys, rec_texts, rec_scores
+
+    def _mostly_cjk_text(self, text):
+        chars = [ch for ch in str(text or "") if not ch.isspace()]
+        if not chars:
+            return False
+        cjk_count = 0
+        for ch in chars:
+            code = ord(ch)
+            if (
+                0x3400 <= code <= 0x4DBF
+                or 0x4E00 <= code <= 0x9FFF
+                or 0xF900 <= code <= 0xFAFF
+            ):
+                cjk_count += 1
+        return cjk_count >= 2 and cjk_count / len(chars) >= 0.6
+
+    def _rect_poly(self, x0, y0, x1, y1):
+        return np.array(
+            [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+            dtype=np.float32,
+        )
+
+    def _ocr_entries_from_arrays(self, polys, texts, scores):
+        entries = []
+        for poly, text, score in zip(polys, texts, scores):
+            try:
+                arr = np.array(poly, dtype=np.float32)
+                xs = arr[:, 0]
+                ys = arr[:, 1]
+                x0 = float(xs.min())
+                x1 = float(xs.max())
+                y0 = float(ys.min())
+                y1 = float(ys.max())
+                entries.append(
+                    {
+                        "poly": arr,
+                        "text": str(text or ""),
+                        "score": float(score or 0.0),
+                        "x0": x0,
+                        "x1": x1,
+                        "y0": y0,
+                        "y1": y1,
+                        "cx": (x0 + x1) / 2.0,
+                        "cy": (y0 + y1) / 2.0,
+                        "width": max(1.0, x1 - x0),
+                        "height": max(1.0, y1 - y0),
+                    }
+                )
+            except Exception:
+                continue
+        return entries
+
+    def _split_tall_cjk_entries(self, entries):
+        if not entries:
+            return entries
+        heights = [e["height"] for e in entries if e["height"] > 0]
+        median_h = float(np.median(heights)) if heights else 16.0
+        split_entries = []
+        for entry in entries:
+            chars = [ch for ch in entry["text"] if not ch.isspace()]
+            should_split = (
+                len(chars) >= 2
+                and self._mostly_cjk_text(entry["text"])
+                and entry["height"] >= max(median_h * 2.2, entry["width"] * 1.8)
+            )
+            if not should_split:
+                split_entries.append(entry)
+                continue
+            count = len(chars)
+            for idx, ch in enumerate(chars):
+                y0 = entry["y0"] + entry["height"] * idx / count
+                y1 = entry["y0"] + entry["height"] * (idx + 1) / count
+                item = dict(entry)
+                item["text"] = ch
+                item["poly"] = self._rect_poly(entry["x0"], y0, entry["x1"], y1)
+                item["y0"] = y0
+                item["y1"] = y1
+                item["cy"] = (y0 + y1) / 2.0
+                item["height"] = max(1.0, y1 - y0)
+                split_entries.append(item)
+        return split_entries
+
+    def _join_row_texts(self, row_entries):
+        parts = []
+        for entry in sorted(row_entries, key=lambda e: (e["x0"], e["y0"])):
+            text = entry["text"].strip()
+            if text:
+                parts.append(text)
+        return " ".join(parts)
+
+    def merge_nested_dictionary_rows(self, polys, texts, scores, image_width):
+        """Merge inner headword/definition subcolumns into horizontal dictionary rows."""
+        entries = self._ocr_entries_from_arrays(polys, texts, scores)
+        if len(entries) < 2:
+            return polys, texts, scores
+        entries = self._split_tall_cjk_entries(entries)
+        heights = [e["height"] for e in entries if e["height"] > 0]
+        median_h = float(np.median(heights)) if heights else 16.0
+        row_threshold = max(10.0, median_h * 0.75)
+        split = image_width / 2.0 if image_width else None
+        columns = [
+            [e for e in entries if split is None or e["cx"] < split],
+            [e for e in entries if split is not None and e["cx"] >= split],
+        ]
+
+        merged = []
+        for column_entries in columns:
+            if not column_entries:
+                continue
+            rows = []
+            for entry in sorted(column_entries, key=lambda e: (e["cy"], e["x0"])):
+                target = None
+                for row in rows:
+                    if abs(entry["cy"] - row["cy"]) <= row_threshold:
+                        target = row
+                        break
+                if target is None:
+                    rows.append({"cy": entry["cy"], "items": [entry]})
+                else:
+                    target["items"].append(entry)
+                    target["cy"] = sum(item["cy"] for item in target["items"]) / len(
+                        target["items"]
+                    )
+            for row in sorted(rows, key=lambda r: r["cy"]):
+                row_entries = row["items"]
+                if len(row_entries) == 1:
+                    merged.append(row_entries[0])
+                    continue
+                x0 = min(e["x0"] for e in row_entries)
+                x1 = max(e["x1"] for e in row_entries)
+                y0 = min(e["y0"] for e in row_entries)
+                y1 = max(e["y1"] for e in row_entries)
+                score = sum(e["score"] for e in row_entries) / len(row_entries)
+                merged.append(
+                    {
+                        "poly": self._rect_poly(x0, y0, x1, y1),
+                        "text": self._join_row_texts(row_entries),
+                        "score": score,
+                        "x0": x0,
+                        "x1": x1,
+                        "y0": y0,
+                        "y1": y1,
+                        "cx": (x0 + x1) / 2.0,
+                        "cy": (y0 + y1) / 2.0,
+                        "width": max(1.0, x1 - x0),
+                        "height": max(1.0, y1 - y0),
+                    }
+                )
+        if not merged:
+            return polys, texts, scores
+        return (
+            [entry["poly"] for entry in merged],
+            [entry["text"] for entry in merged],
+            [entry["score"] for entry in merged],
+        )
 
     def reorder_ocr_result_by_layout(self, polys, texts, scores, image_width):
         if not polys or image_width is None or image_width <= 0:
@@ -4454,7 +5314,10 @@ class MainWindow(QMainWindow):
                 right = [b for b in boxes if b["x0"] >= chosen_split]
                 left.sort(key=lambda b: (b["y0"], b["x0"]))
                 right.sort(key=lambda b: (b["y0"], b["x0"]))
-                ordered = left + right
+                if getattr(self, "reading_mode", "horizontal") == "vertical":
+                    ordered = right + left
+                else:
+                    ordered = left + right
                 indices = [b["idx"] for b in ordered]
                 return (
                     [polys[i] for i in indices],
@@ -4476,7 +5339,10 @@ class MainWindow(QMainWindow):
                     columns.append(
                         {"items": [b], "max_x": b["x1"], "min_x": b["x0"]}
                     )
-            columns.sort(key=lambda c: c["min_x"])
+            columns.sort(
+                key=lambda c: c["min_x"],
+                reverse=getattr(self, "reading_mode", "horizontal") == "vertical",
+            )
             ordered = []
             for col in columns:
                 col["items"].sort(key=lambda b: (b["y0"], b["x0"]))
@@ -4494,6 +5360,7 @@ class MainWindow(QMainWindow):
     def _get_ppstructure_engine(self):
         if getattr(self, "_ppstructure_engine", None) is None:
             try:
+                self._ensure_paddleocr_imported()
                 self._ppstructure_engine = PPStructureV3(
                     layout_detection_model_dir=self.settings.get(
                         "ppstructure_layout_dir",
@@ -4537,43 +5404,62 @@ class MainWindow(QMainWindow):
                     continue
             if not rects:
                 return blocks
-            # Two-column mode: force center split, read left then right
-            if self.two_column_lr and page_width:
-                split = page_width / 2.0
+            def _order_by_split(split, left_to_right=True):
                 left = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) < split]
                 right = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) >= split]
+                if not left or not right:
+                    return None
                 left.sort(key=lambda r: (r["y0"], r["x0"]))
                 right.sort(key=lambda r: (r["y0"], r["x0"]))
-                ordered = [blocks[r["idx"]] for r in left] + [
-                    blocks[r["idx"]] for r in right
-                ]
-                return ordered
-            # Default: try to find a strong central split
-            if page_width:
+                ordered_rects = left + right if left_to_right else right + left
+                return [blocks[r["idx"]] for r in ordered_rects]
+
+            def _best_column_split(prefer_center=False):
                 centers = sorted(
                     [(r["idx"], (r["x0"] + r["x1"]) / 2.0) for r in rects],
                     key=lambda x: x[1],
                 )
+                if len(centers) < 2:
+                    return None
+                min_gap = max(
+                    12.0,
+                    (page_width or 0) * 0.05 if page_width else 0.0,
+                )
                 best = None
-                center_x = page_width / 2.0
+                center_x = page_width / 2.0 if page_width else None
                 for i in range(len(centers) - 1):
                     gap = centers[i + 1][1] - centers[i][1]
-                    if gap <= page_width * 0.05:
+                    if gap <= min_gap:
                         continue
                     mid = (centers[i + 1][1] + centers[i][1]) / 2.0
-                    dist = abs(mid - center_x)
-                    if best is None or dist < best["dist"]:
-                        best = {"mid": mid, "dist": dist, "gap": gap}
-                if best:
-                    split = best["mid"]
-                    left = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) < split]
-                    right = [r for r in rects if ((r["x0"] + r["x1"]) / 2.0) >= split]
-                    left.sort(key=lambda r: (r["y0"], r["x0"]))
-                    right.sort(key=lambda r: (r["y0"], r["x0"]))
-                    ordered = [blocks[r["idx"]] for r in left] + [
-                        blocks[r["idx"]] for r in right
-                    ]
-                    return ordered
+                    if prefer_center and center_x is not None:
+                        score = (abs(mid - center_x), -gap)
+                    else:
+                        score = (-gap,)
+                    if best is None or score < best["score"]:
+                        best = {"mid": mid, "score": score}
+                return best["mid"] if best else None
+
+            # Modern two-column mode: infer the gutter from block positions, then read left column first.
+            if self.two_column_lr:
+                split = _best_column_split(prefer_center=True)
+                if split is None and page_width:
+                    split = page_width / 2.0
+                if split is not None:
+                    ordered = _order_by_split(split, left_to_right=True)
+                    if ordered:
+                        return ordered
+            # Default: try to find a strong central split
+            if page_width:
+                split = _best_column_split(prefer_center=True)
+                if split is not None:
+                    ordered = _order_by_split(
+                        split,
+                        left_to_right=getattr(self, "reading_mode", "horizontal")
+                        != "vertical",
+                    )
+                    if ordered:
+                        return ordered
 
             median_width = float(np.median([r["x1"] - r["x0"] for r in rects]))
             col_gap = max(
@@ -4593,7 +5479,10 @@ class MainWindow(QMainWindow):
                         break
                 if not placed:
                     columns.append({"items": [r], "max_x": r["x1"]})
-            columns.sort(key=lambda c: c["items"][0]["x0"])
+            columns.sort(
+                key=lambda c: c["items"][0]["x0"],
+                reverse=getattr(self, "reading_mode", "horizontal") == "vertical",
+            )
             ordered = []
             for col in columns:
                 col["items"].sort(key=lambda r: (r["y0"], r["x0"]))
@@ -4649,6 +5538,8 @@ class MainWindow(QMainWindow):
             for poly, text, score in zip(polys, texts, scores):
                 poly_list = poly.tolist() if hasattr(poly, "tolist") else poly
                 result.append([poly_list, (text, float(score))])
+            if result:
+                return _sort_blocks(result, width)
             return result
         except Exception as exc:
             logger.error("PP-Structure recognition failed on %s: %s", image_path, exc)
@@ -4682,7 +5573,7 @@ class MainWindow(QMainWindow):
             try:
                 self.det_model_dir = new_det
                 self.rec_model_dir = new_rec
-                self._reload_ocr_backends()
+                self._reload_ocr_models_if_loaded()
                 self.settings[SETTING_DET_MODEL_PATH] = new_det or ""
                 self.settings[SETTING_REC_MODEL_PATH] = new_rec or ""
                 changed = True
@@ -4693,7 +5584,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "Warning", self.get_str("customModelInvalid")
                 )
-                self._reload_ocr_backends()
+                self._reload_ocr_models_if_loaded()
                 changed = False
         if changed:
             self.settings.save()
@@ -4722,7 +5613,33 @@ class MainWindow(QMainWindow):
             raise ValueError("no shapes to proofread")
         items = []
         context_segments = []
-        for idx, shape in enumerate(self.canvas.shapes):
+
+        indexed_shapes = list(enumerate(self.canvas.shapes))
+        if (
+            getattr(self, "reading_mode", "horizontal") == "vertical"
+            or getattr(self, "two_column_lr", False)
+        ):
+            rectangles = [
+                [[int(p.x()), int(p.y())] for p in shape.points]
+                for _, shape in indexed_shapes
+            ]
+            sorted_rectangles = self.sort_rectangles(rectangles, row_height_threshold=0.5)
+            ordered_shapes = []
+            used = set()
+            for sorted_rect in sorted_rectangles:
+                for old_idx, rect in enumerate(rectangles):
+                    if old_idx not in used and rect == sorted_rect:
+                        ordered_shapes.append(indexed_shapes[old_idx])
+                        used.add(old_idx)
+                        break
+            ordered_shapes.extend(
+                indexed_shapes[idx]
+                for idx in range(len(indexed_shapes))
+                if idx not in used
+            )
+            indexed_shapes = ordered_shapes
+
+        for idx, shape in indexed_shapes:
             bbox = [[int(p.x()), int(p.y())] for p in shape.points]
             text = shape.label or ""
             score = getattr(shape, "rec_score", 0.0) or 0.0
@@ -4747,6 +5664,8 @@ class MainWindow(QMainWindow):
         return payload
 
     def _request_json_proofreader(self, payload):
+        if requests is None:
+            raise RuntimeError("Python package 'requests' is required for AI proofread.")
         response = requests.post(
             self.proofreader_endpoint,
             json=payload,
@@ -4834,6 +5753,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _request_openai_proofreader(self, payload):
+        if requests is None:
+            raise RuntimeError("Python package 'requests' is required for AI proofread.")
         prompt = self._compose_openai_prompt(payload)
         model_name = self.proofreader_model or "gpt-3.5-turbo"
         body = {
@@ -5216,6 +6137,9 @@ class MainWindow(QMainWindow):
         if not self.proofreader_endpoint:
             QMessageBox.warning(self, "Warning", self.get_str("autoProofreadNoEndpoint"))
             return
+        if self.proofreader_style == "openai" and not self.proofreader_api_key:
+            QMessageBox.warning(self, "Warning", self.get_str("autoProofreadNoEndpoint"))
+            return
         try:
             payload = self._build_proofread_payload()
         except ValueError:
@@ -5229,7 +6153,7 @@ class MainWindow(QMainWindow):
                 data = self._request_openai_proofreader(payload)
             else:
                 data = self._request_json_proofreader(payload)
-        except requests.RequestException as exc:
+        except Exception as exc:
             logger.warning("Proofread request failed: %s", exc)
             QMessageBox.warning(
                 self,
@@ -5281,6 +6205,7 @@ class MainWindow(QMainWindow):
             )
 
     def reRecognition(self):
+        self._ensure_ocr_models_loaded()
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         if self.canvas.shapes:
             self.result_dic = []
@@ -5381,6 +6306,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Information", "Draw a box!")
 
     def singleRerecognition(self):
+        self._ensure_ocr_models_loaded()
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         for shape in self.canvas.selectedShapes:
             shape.is_ai_corrected = False
@@ -5438,6 +6364,7 @@ class MainWindow(QMainWindow):
         """
         Table Recognition
         """
+        self._ensure_ocr_models_loaded()
         from tablepyxl import tablepyxl
 
         import time
@@ -5583,6 +6510,7 @@ class MainWindow(QMainWindow):
         """
         re-recognise text in a cell
         """
+        self._ensure_ocr_models_loaded()
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         for shape in self.canvas.selectedShapes:
             box = [[int(p.x()), int(p.y())] for p in shape.points]
@@ -5724,7 +6652,15 @@ class MainWindow(QMainWindow):
         self.comboBox = QComboBox()
         self.comboBox.setObjectName("comboBox")
         self.comboBox.addItems(
-            ["Chinese & English", "English", "French", "German", "Korean", "Japanese"]
+            [
+                "Chinese & English",
+                "English",
+                "French",
+                "German",
+                "Korean",
+                "Japanese",
+                "Vietnamese / Latin",
+            ]
         )
         vbox.addWidget(self.panel)
         vbox.addWidget(self.comboBox)
@@ -5761,9 +6697,23 @@ class MainWindow(QMainWindow):
             "Korean": "korean",
             "Japanese": "japan",
         }
-        if current_text in lg_idx:
+        if current_text == "Vietnamese / Latin":
+            latin_rec_dir = os.path.join(
+                self._get_official_model_dir(), "latin_PP-OCRv5_mobile_rec"
+            )
+            if not os.path.isdir(latin_rec_dir):
+                QMessageBox.warning(
+                    self, "Warning", self.get_str("customModelInvalid")
+                )
+                self.dialog.close()
+                return
+            self.rec_model_dir = latin_rec_dir
+            self.settings[SETTING_REC_MODEL_PATH] = latin_rec_dir
+            self.settings.save()
+            self._reload_ocr_models_if_loaded(lang="en")
+        elif current_text in lg_idx:
             choose_lang = lg_idx[current_text]
-            self._reload_ocr_backends(lang=choose_lang)
+            self._reload_ocr_models_if_loaded(lang=choose_lang)
         else:
             logger.error("Invalid language selection")
         self.dialog.close()
@@ -5785,6 +6735,7 @@ class MainWindow(QMainWindow):
                 self.actions.saveLabel.setEnabled(True)
                 self.actions.saveRec.setEnabled(True)
                 self.actions.exportFullText.setEnabled(True)
+                self.actions.exportCurrentText.setEnabled(True)
                 self.actions.exportJSON.setEnabled(True)
 
     def saveFilestate(self):
@@ -5833,9 +6784,9 @@ class MainWindow(QMainWindow):
                 f.write(key + "\t")
                 f.write(json.dumps(self.Cachelabel[key], ensure_ascii=False) + "\n")
 
-    def saveLabelFile(self):
+    def saveLabelFile(self, mode="Manual"):
         self.saveFilestate()
-        self.savePPlabel()
+        self.savePPlabel(mode=mode)
 
     def saveRecResult(self):
         if {} in [self.PPlabelpath, self.PPlabel, self.fileStatedict]:
@@ -5850,6 +6801,7 @@ class MainWindow(QMainWindow):
             os.mkdir(crop_img_dir)
 
         with open(rec_gt_dir, "w", encoding="utf-8") as f:
+            saved_count = 0
             for key in self.fileStatedict:
                 labels = self._get_labels_for_image(key)
                 if not labels:
@@ -5860,8 +6812,6 @@ class MainWindow(QMainWindow):
                         np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
                     )
                     for i, label in enumerate(labels):
-                        if label["difficult"]:
-                            continue
                         img_crop = get_rotate_crop_image(
                             img, np.array(label["points"], np.float32)
                         )
@@ -5874,6 +6824,7 @@ class MainWindow(QMainWindow):
                         cv2.imencode(".jpg", img_crop)[1].tofile(
                             crop_img_dir + img_name
                         )
+                        saved_count += 1
                         f.write("crop_img/" + img_name + "\t")
                         f.write(label["transcription"] + "\n")
                 except KeyError as e:
@@ -5888,14 +6839,23 @@ class MainWindow(QMainWindow):
                 "The following images can not be saved, please check the image path and labels.\n"
                 + "".join(str(i) + "\n" for i in ques_img),
             )
-        QMessageBox.information(
-            self,
-            "Information",
-            "Cropped images have been saved in " + str(crop_img_dir),
-        )
+        if saved_count:
+            QMessageBox.information(
+                self,
+                "Information",
+                f"Cropped images have been saved in {crop_img_dir}\n"
+                f"Saved {saved_count} cropped images.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Information",
+                "No cropped images were exported. Please check the image path and labels.",
+            )
 
     def exportFullText(self):
-        if not self.PPlabel or not self.mImgList:
+        self._sync_current_image_for_export()
+        if (not self.Cachelabel and not self.PPlabel) or not self.mImgList:
             QMessageBox.information(
                 self, "Information", self.get_str("exportFullTextEmpty")
             )
@@ -5918,8 +6878,6 @@ class MainWindow(QMainWindow):
             if not labels:
                 continue
             for label in labels:
-                if label.get("difficult"):
-                    continue
                 text = label.get("transcription", "")
                 if text:
                     lines.append(text)
@@ -5941,6 +6899,54 @@ class MainWindow(QMainWindow):
             self,
             "Information",
             self.get_str("exportFullTextSuccess").format(save_path),
+        )
+
+    def _sync_current_image_for_export(self):
+        """Persist the current canvas before an export, without changing page."""
+        if not self.filePath or not self.dirty:
+            return
+        same_image = self.canvas.isInTheSameImage
+        self.canvas.isInTheSameImage = True
+        try:
+            self._saveFile(self.getImglabelidx(self.filePath), mode="Manual")
+        finally:
+            self.canvas.isInTheSameImage = same_image
+
+    def exportCurrentText(self):
+        if not self.filePath or not self.mImgList:
+            QMessageBox.information(
+                self, "Information", self.get_str("exportFullTextEmpty")
+            )
+            return
+
+        self._sync_current_image_for_export()
+        base_dir = os.path.dirname(self.PPlabelpath)
+        default_path = os.path.join(
+            base_dir, os.path.splitext(os.path.basename(self.filePath))[0] + ".txt"
+        )
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.get_str("exportCurrentText"),
+            default_path,
+            "Text Files (*.txt)",
+        )
+        if not save_path:
+            return
+
+        labels = self._get_labels_for_image(self.filePath) or []
+        lines = [label.get("transcription", "") for label in labels]
+        lines = [line for line in lines if line]
+        if not lines:
+            QMessageBox.information(
+                self, "Information", self.get_str("exportFullTextEmpty")
+            )
+            return
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        QMessageBox.information(
+            self,
+            "Information",
+            self.get_str("exportCurrentTextSuccess").format(save_path),
         )
 
     def speedChoose(self):
@@ -6006,6 +7012,307 @@ class MainWindow(QMainWindow):
         self._noSelectionSlot = False
         self.canvas.loadShapes(shapes, replace=replace)
         logger.debug("loadShapes")
+
+    def _shape_quad_points(self, shape):
+        points = list(getattr(shape, "points", []) or [])
+        if len(points) != 4:
+            return None
+
+        sums = [p.x() + p.y() for p in points]
+        diffs = [p.x() - p.y() for p in points]
+        tl = points[sums.index(min(sums))]
+        br = points[sums.index(max(sums))]
+        tr = points[diffs.index(max(diffs))]
+        bl = points[diffs.index(min(diffs))]
+        return [QPointF(tl), QPointF(tr), QPointF(br), QPointF(bl)]
+
+    def _lerp_point(self, a, b, t):
+        return QPointF(a.x() + (b.x() - a.x()) * t, a.y() + (b.y() - a.y()) * t)
+
+    def _quad_width_height(self, quad):
+        tl, tr, br, bl = quad
+        width = (
+            ((tr.x() - tl.x()) ** 2 + (tr.y() - tl.y()) ** 2) ** 0.5
+            + ((br.x() - bl.x()) ** 2 + (br.y() - bl.y()) ** 2) ** 0.5
+        ) / 2.0
+        height = (
+            ((bl.x() - tl.x()) ** 2 + (bl.y() - tl.y()) ** 2) ** 0.5
+            + ((br.x() - tr.x()) ** 2 + (br.y() - tr.y()) ** 2) ** 0.5
+        ) / 2.0
+        return width, height
+
+    def _split_quad_to_character_quads(self, quad, count, direction):
+        if count <= 1:
+            return [quad]
+        tl, tr, br, bl = quad
+        pieces = []
+        for idx in range(count):
+            t0 = idx / count
+            t1 = (idx + 1) / count
+            if direction == "vertical":
+                pieces.append(
+                    [
+                        self._lerp_point(tl, bl, t0),
+                        self._lerp_point(tr, br, t0),
+                        self._lerp_point(tr, br, t1),
+                        self._lerp_point(tl, bl, t1),
+                    ]
+                )
+            else:
+                pieces.append(
+                    [
+                        self._lerp_point(tl, tr, t0),
+                        self._lerp_point(tl, tr, t1),
+                        self._lerp_point(bl, br, t1),
+                        self._lerp_point(bl, br, t0),
+                    ]
+                )
+        return pieces
+
+    def _clone_shape_for_character(self, source_shape, char, points):
+        shape = Shape(
+            label=char,
+            line_color=source_shape.line_color,
+            difficult=source_shape.difficult,
+            key_cls=getattr(source_shape, "key_cls", "None"),
+            paintLabel=self.displayLabelOption.isChecked(),
+            paintIdx=self.displayIndexOption.isChecked(),
+            font_family=self.label_font_family,
+        )
+        shape.fill_color = source_shape.fill_color
+        shape.rec_score = getattr(source_shape, "rec_score", 1.0)
+        shape.is_ai_corrected = False
+        shape.history = copy.deepcopy(getattr(source_shape, "history", []) or [])
+        shape.instance_id = str(uuid.uuid4())
+        for point in points:
+            x, y, _ = self.canvas.snapPointToCanvas(point.x(), point.y())
+            shape.addPoint(QPointF(x, y))
+        shape.close()
+        return shape
+
+    def splitCurrentBoxesToCharacters(self, direction="auto"):
+        if not self.canvas.shapes:
+            QMessageBox.information(self, "Information", "当前图片没有可切分的标注框。")
+            return
+
+        new_shapes = []
+        split_count = 0
+        for shape in self.canvas.shapes:
+            text = "".join(ch for ch in (shape.label or "") if not ch.isspace())
+            quad = self._shape_quad_points(shape)
+            if not text or len(text) <= 1 or quad is None:
+                new_shapes.append(shape)
+                continue
+
+            split_direction = direction
+            if split_direction == "auto":
+                width, height = self._quad_width_height(quad)
+                split_direction = "vertical" if height > width * 1.25 else "horizontal"
+
+            char_quads = self._split_quad_to_character_quads(
+                quad, len(text), split_direction
+            )
+            for char, char_quad in zip(text, char_quads):
+                new_shapes.append(self._clone_shape_for_character(shape, char, char_quad))
+            split_count += 1
+
+        if split_count == 0:
+            QMessageBox.information(
+                self, "Information", "没有发现长度超过 1 的文字框可切分。"
+            )
+            return
+
+        self.labelList.clear()
+        self.indexList.clear()
+        self.BoxList.clear()
+        self.itemsToShapes.clear()
+        self.shapesToItems.clear()
+        self.itemsToShapesbox.clear()
+        self.shapesToItemsbox.clear()
+        self.canvas.selectedShapes = []
+        self.canvas.loadShapes([], replace=True)
+        self.loadShapes(new_shapes)
+        self.updateIndexList()
+        self.setDirty()
+
+        was_same_image = self.canvas.isInTheSameImage
+        self.canvas.isInTheSameImage = True
+        try:
+            self.saveFile(mode="Manual")
+        finally:
+            self.canvas.isInTheSameImage = was_same_image
+
+        QMessageBox.information(
+            self,
+            "Information",
+            f"已将 {split_count} 个文字框切成 {len(new_shapes)} 个标注框。",
+        )
+
+    @staticmethod
+    def _ancient_group_bounds(shape):
+        """Return an axis-aligned box for a Shape, in page coordinates."""
+        points = list(getattr(shape, "points", []) or [])
+        if not points:
+            return None
+        xs = [point.x() for point in points]
+        ys = [point.y() for point in points]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    @staticmethod
+    def _ancient_group_number(text):
+        """Recognise the small number / number-range printed below a glyph."""
+        normalized = (text or "").strip().replace("–", "-").replace("—", "-")
+        match = re.fullmatch(r"(\d{1,4})(?:\s*-\s*(\d{1,4}))?", normalized)
+        if not match:
+            return None
+        start, end = match.groups()
+        return start if end is None else f"{start}-{end}"
+
+    def _make_ancient_group_shape(self, bounds, number, glyph_shapes, source_shapes):
+        x0, y0, x1, y1 = bounds
+        shape = Shape(
+            label=f"【古文字组】{number}",
+            line_color=QColor(170, 0, 255, 255),
+            difficult=True,
+            paintLabel=self.displayLabelOption.isChecked(),
+            paintIdx=self.displayIndexOption.isChecked(),
+            font_family=self.label_font_family,
+        )
+        for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            shape.addPoint(QPointF(x, y))
+        shape.close()
+        source_text = "".join((item.label or "").strip() for item in source_shapes)
+        self._record_shape_history(
+            shape,
+            shape.label,
+            source="ancient-group-candidate",
+            extra={
+                "number": number,
+                "glyph_instance_ids": [item.instance_id for item in glyph_shapes],
+                "source_instance_ids": [item.instance_id for item in source_shapes],
+                "source_text": source_text,
+            },
+        )
+        return shape
+
+    def findAncientCharacterGroups(self):
+        """Add conservative candidate boxes for ancient-character groups.
+
+        The dictionary's glyphs are deliberately *not* OCR'd here.  A number
+        box anchors each candidate, while unusually tall nearby boxes form the
+        glyph crop.  The nearby source boxes are preserved as metadata on the
+        new shape.  Existing labels are never changed.
+        """
+        shapes = list(self.canvas.shapes)
+        if not shapes:
+            QMessageBox.information(self, "Information", "请先在本页运行识别，或保留已有的标注框。")
+            return
+
+        existing_numbers = {
+            (item.label or "").replace("【古文字组】", "").strip()
+            for item in shapes
+            if (item.label or "").startswith("【古文字组】")
+        }
+        records = []
+        for item in shapes:
+            if (item.label or "").startswith("【古文字组】"):
+                continue
+            bounds = self._ancient_group_bounds(item)
+            if bounds is None:
+                continue
+            x0, y0, x1, y1 = bounds
+            records.append(
+                {
+                    "shape": item,
+                    "text": (item.label or "").strip(),
+                    "bounds": bounds,
+                    "cx": (x0 + x1) / 2.0,
+                    "cy": (y0 + y1) / 2.0,
+                    "w": x1 - x0,
+                    "h": y1 - y0,
+                }
+            )
+        if not records:
+            QMessageBox.information(self, "Information", "本页没有可用于聚合的标注框。")
+            return
+
+        heights = sorted(record["h"] for record in records if record["h"] > 0)
+        median_height = heights[len(heights) // 2] if heights else 20
+        glyph_min_height = max(36, median_height * 1.8)
+        anchors = [
+            record for record in records
+            if self._ancient_group_number(record["text"]) is not None
+            and self._ancient_group_number(record["text"]) not in existing_numbers
+        ]
+        candidates = [
+            record for record in records
+            if record["h"] >= glyph_min_height
+            and self._ancient_group_number(record["text"]) is None
+        ]
+
+        new_shapes = []
+        for anchor in anchors:
+            number = self._ancient_group_number(anchor["text"])
+            # Number captions are normally immediately under a glyph row.
+            eligible = [
+                glyph for glyph in candidates
+                if glyph["cy"] <= anchor["cy"] + 4
+                and anchor["cy"] - glyph["cy"] <= 180
+                and abs(anchor["cx"] - glyph["cx"]) <= 250
+            ]
+            if not eligible:
+                continue
+            primary = min(
+                eligible,
+                key=lambda glyph: (
+                    abs(anchor["cx"] - glyph["cx"]) * 0.55
+                    + abs(anchor["cy"] - glyph["cy"])
+                ),
+            )
+            # A historical form may be printed as several neighbouring glyphs.
+            glyphs = [
+                glyph for glyph in eligible
+                if abs(glyph["cy"] - primary["cy"]) <= max(26, primary["h"] * 0.65)
+                and glyph["bounds"][0] <= primary["bounds"][2] + 260
+                and glyph["bounds"][2] >= primary["bounds"][0] - 260
+            ]
+            x0 = min(glyph["bounds"][0] for glyph in glyphs)
+            y0 = min(glyph["bounds"][1] for glyph in glyphs)
+            x1 = max(glyph["bounds"][2] for glyph in glyphs)
+            y1 = max(glyph["bounds"][3] for glyph in glyphs)
+
+            # Keep the citation fragments that begin with this number.  They
+            # remain separate visible OCR boxes; this list is the association.
+            start_number = number.split("-", 1)[0]
+            source_shapes = [
+                record["shape"] for record in records
+                if record["shape"] is not anchor["shape"]
+                and re.match(rf"^{re.escape(start_number)}(?:\D|$)", record["text"])
+                and abs(record["cy"] - anchor["cy"]) <= 210
+            ]
+            new_shapes.append(
+                self._make_ancient_group_shape(
+                    (x0, y0, x1, y1), number,
+                    [glyph["shape"] for glyph in glyphs], source_shapes,
+                )
+            )
+
+        if not new_shapes:
+            QMessageBox.information(
+                self, "Information",
+                "未找到足够明确的候选。可先运行当前页识别，或手工保留编号与字形框后再试。",
+            )
+            return
+
+        for shape in new_shapes:
+            self.addLabel(shape)
+        self.canvas.loadShapes(new_shapes, replace=False)
+        self.updateIndexList()
+        self.setDirty()
+        QMessageBox.information(
+            self, "Information",
+            f"已新增 {len(new_shapes)} 个古文字聚合候选框（紫色）。原有框未改动，请校对后保存。",
+        )
 
     def lockSelectedShape(self):
         """lock the selected shapes.
@@ -6095,7 +7402,51 @@ class MainWindow(QMainWindow):
         if not rect_info:
             return rectangles
         mode = getattr(self, "reading_mode", "horizontal")
+        def sort_by_columns(left_to_right=True):
+            if len(rect_info) < 2:
+                return rectangles
+            left_center = min(info["center_x"] for info in rect_info)
+            right_center = max(info["center_x"] for info in rect_info)
+            if left_center == right_center:
+                ordered = sorted(rect_info, key=lambda info: info["center_y"])
+                return [rectangles[info["index"]] for info in ordered]
+            for _ in range(8):
+                left_group = []
+                right_group = []
+                for info in rect_info:
+                    if abs(info["center_x"] - left_center) <= abs(
+                        info["center_x"] - right_center
+                    ):
+                        left_group.append(info)
+                    else:
+                        right_group.append(info)
+                if not left_group or not right_group:
+                    break
+                new_left = sum(info["center_x"] for info in left_group) / len(
+                    left_group
+                )
+                new_right = sum(info["center_x"] for info in right_group) / len(
+                    right_group
+                )
+                if new_left == left_center and new_right == right_center:
+                    break
+                left_center, right_center = new_left, new_right
+            split = (left_center + right_center) / 2.0
+            left = [info for info in rect_info if info["center_x"] < split]
+            right = [info for info in rect_info if info["center_x"] >= split]
+            if not left or not right:
+                ordered = sorted(rect_info, key=lambda info: (info["center_y"], info["center_x"]))
+                return [rectangles[info["index"]] for info in ordered]
+            left.sort(key=lambda info: (info["center_y"], info["center_x"]))
+            right.sort(key=lambda info: (info["center_y"], info["center_x"]))
+            ordered = left + right if left_to_right else right + left
+            return [rectangles[info["index"]] for info in ordered]
+
+        if getattr(self, "two_column_lr", False):
+            return sort_by_columns(left_to_right=True)
         if mode == "vertical":
+            if getattr(self, "layout_first", False):
+                return sort_by_columns(left_to_right=False)
             avg_width = (
                 sum(info["width"] for info in rect_info) / len(rect_info)
                 if rect_info
@@ -6189,6 +7540,106 @@ class MainWindow(QMainWindow):
             self,
             "Information",
             self.get_str("resortSuccess"),
+        )
+
+    def _sort_label_entries_by_current_order(self, labels):
+        if not labels:
+            return labels, False
+        rectangles = []
+        sortable_indices = []
+        for idx, label in enumerate(labels):
+            points = label.get("points") if isinstance(label, dict) else None
+            if not points:
+                continue
+            try:
+                rectangles.append(
+                    [[float(point[0]), float(point[1])] for point in points]
+                )
+                sortable_indices.append(idx)
+            except Exception:
+                continue
+        if len(rectangles) < 2:
+            return labels, False
+
+        sorted_rectangles = self.sort_rectangles(rectangles, row_height_threshold=0.5)
+        index_map = []
+        used = set()
+        for sorted_rect in sorted_rectangles:
+            for old_idx, rect in enumerate(rectangles):
+                if old_idx not in used and rect == sorted_rect:
+                    index_map.append(sortable_indices[old_idx])
+                    used.add(old_idx)
+                    break
+        ordered = set(index_map)
+        index_map.extend(idx for idx in range(len(labels)) if idx not in ordered)
+        sorted_labels = [labels[idx] for idx in index_map]
+        return sorted_labels, sorted_labels != labels
+
+    def _resort_label_dict_by_current_order(self, label_dict):
+        changed = 0
+        if not label_dict:
+            return changed
+        for key in list(label_dict.keys()):
+            sorted_labels, did_change = self._sort_label_entries_by_current_order(
+                label_dict.get(key)
+            )
+            if did_change:
+                label_dict[key] = sorted_labels
+                changed += 1
+        return changed
+
+    def resortAllBoxPositions(self):
+        if not getattr(self, "PPlabel", None) and not getattr(self, "Cachelabel", None):
+            QMessageBox.information(self, "Information", self.get_str("resortAllEmpty"))
+            return
+        reply = QMessageBox.question(
+            self,
+            "Information",
+            self.get_str("resortAllConfirm"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._sync_current_image_for_export()
+        pplabel = getattr(self, "PPlabel", {})
+        cachelabel = getattr(self, "Cachelabel", {})
+        pplabel_changed = self._resort_label_dict_by_current_order(pplabel)
+        cache_changed = self._resort_label_dict_by_current_order(cachelabel)
+
+        if pplabel_changed:
+            self.savePPlabel(mode="Auto")
+        if cache_changed:
+            self.saveCacheLabel()
+
+        current_key = self.getImglabelidx(self.filePath) if self.filePath else None
+        if current_key and (
+            current_key in getattr(self, "PPlabel", {})
+            or current_key in getattr(self, "Cachelabel", {})
+        ):
+            self.itemsToShapes.clear()
+            self.shapesToItems.clear()
+            self.itemsToShapesbox.clear()
+            self.shapesToItemsbox.clear()
+            self.labelList.clear()
+            self.BoxList.clear()
+            self.indexList.clear()
+            self.canvas.selectedShapes = []
+            self.canvas.loadShapes([], replace=True)
+            self.showBoundingBoxFromPPlabel(self.filePath)
+            self.updateBoxlist()
+            self.updateIndexList()
+            self.setClean()
+
+        QMessageBox.information(
+            self,
+            "Information",
+            self.get_str("resortAllSuccess").format(
+                pplabel_changed + cache_changed,
+                pplabel_changed,
+                cache_changed,
+            ),
         )
 
 
@@ -6318,6 +7769,7 @@ def get_main_app(argv=[]):
 
 def main():
     """construct main app and run it"""
+    configure_logging()
     app, _win = get_main_app(sys.argv)
     return app.exec_()
 

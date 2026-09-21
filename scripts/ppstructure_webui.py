@@ -62,6 +62,11 @@ def parse_args():
         default="",
         help="Optional: append saved char-text pairs into this CSV; default is approved_dir/approved.csv if approved_dir set.",
     )
+    parser.add_argument(
+        "--strip_html",
+        action="store_true",
+        help="Strip HTML tags from PP-Structure content before显示/保存（适用于表格被输出为 HTML 的情况）。",
+    )
     return parser.parse_args()
 
 
@@ -163,12 +168,29 @@ def extract_text_blocks(entry: Dict) -> Tuple[str, List[List[float]]]:
     return joined_text, bboxes
 
 
+def _strip_html_tags(text: str) -> str:
+    import re
+
+    # Remove script/style blocks
+    text = re.sub(r"(?is)<(script|style).*?>.*?(</\1>)", "", text)
+    # Remove tags
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    return text
+
+
 class AppState:
-    def __init__(self, engine: PPStructureV3, images: List[Path], output_dir: Path):
+    def __init__(
+        self,
+        engine: PPStructureV3,
+        images: List[Path],
+        output_dir: Path,
+        strip_html: bool = False,
+    ):
         self.engine = engine
         self.images = images
         self.output_dir = output_dir
         self.cache: Dict[str, str] = {}  # image_name -> text
+        self.strip_html = strip_html
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def load_image(self, image_name: str):
@@ -183,6 +205,8 @@ class AppState:
         else:
             entry = res[0] if isinstance(res, (list, tuple)) else res
             text, _ = extract_text_blocks(entry)
+        if self.strip_html and text:
+            text = _strip_html_tags(text)
         self.cache[image_name] = text
         return str(img_path), text
 
@@ -306,7 +330,7 @@ def main():
     if not images:
         raise ValueError(f"No images found in {input_dir}")
     engine = build_engine(args.layout_model_dir)
-    state = AppState(engine, images, Path(args.output_dir))
+    state = AppState(engine, images, Path(args.output_dir), strip_html=args.strip_html)
     char_state = None
     if args.char_csv:
         csv_path = Path(args.char_csv)
