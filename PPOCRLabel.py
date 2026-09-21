@@ -171,6 +171,7 @@ from libs.stringBundle import StringBundle
 from libs.canvas import Canvas
 from libs.zoomWidget import ZoomWidget
 from libs.autoDialog import AutoDialog
+from libs.hunyuan_ocr import HunyuanLayout
 from libs.labelDialog import LabelDialog
 from libs.proofreadDialog import ProofreadDialog
 from libs.colorDialog import ColorDialog
@@ -401,12 +402,15 @@ class MainWindow(QMainWindow):
         self.use_qwen = bool(settings.get("use_qwen_ocr_lmstudio", False))
         if self.use_qwen:
             self.use_hunyuan = False
-        self.hunyuan_layout_mode = settings.get("hunyuan_layout_mode", "auto")
-        if self.hunyuan_layout_mode not in {
-            "auto", "horizontal-single", "horizontal-two",
-            "vertical-single", "vertical-two",
-        }:
-            self.hunyuan_layout_mode = "auto"
+        # 混元 / Qwen 版式：默认整页识别（不切栏、不重排）；
+        # 旧设置里的 "auto"（程序自己算中缝）已退役，统一归一化到当前模式表。
+        self.hunyuan_layout_mode = HunyuanLayout.normalize(
+            settings.get("hunyuan_layout_mode", HunyuanLayout.DEFAULT)
+        )
+        # 逐行裁条识别：每条印刷行单独送模型，框与文严格对应（较慢）。
+        self.hunyuan_line_mode = bool(settings.get("hunyuan_line_mode", False))
+        # 音标页模式：IPA 专用提示词（五度调符 + 国际音标字符表，禁注音/拼音代替）。
+        self.hunyuan_ipa_mode = bool(settings.get("hunyuan_ipa_mode", False))
         self.use_ppstructure = bool(stored_ppstructure) and not self.use_hunyuan
         self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
         stored_two_col = settings.get(SETTING_TWO_COLUMN_LR, False)
@@ -414,6 +418,8 @@ class MainWindow(QMainWindow):
             stored_two_col = stored_two_col.lower() in ("1", "true", "yes", "on")
         self.two_column_lr = bool(stored_two_col)
         self.settings[SETTING_TWO_COLUMN_LR] = self.two_column_lr
+        # 视觉模型（混元/Qwen）自己给出阅读顺序时置位，保存前不做几何重排。
+        self.result_order_from_model = False
         # Preload PP-Structure engine on startup when enabled to avoid double initialization later.
         self._ppstructure_engine = None
         stored_proofreader_endpoint = settings.get(SETTING_PROOFREAD_ENDPOINT)
@@ -662,6 +668,9 @@ class MainWindow(QMainWindow):
         # Create and add a widget for showing current label items
         self.labelList = EditInList()
         self.labelList.setWordWrap(True)
+        # 长标签（例如两行并成一行的识别结果）要换行显示，不要省略或遮尾。
+        self.labelList.setTextElideMode(Qt.ElideNone)
+        self.labelList.setUniformItemSizes(False)
         self.charCandidateController = CharacterCandidateController(
             self.labelList,
             lambda item: self._shape_from_label_item(item),
@@ -1480,13 +1489,7 @@ class MainWindow(QMainWindow):
         self.hunyuanLayoutActionGroup = QActionGroup(self)
         self.hunyuanLayoutActionGroup.setExclusive(True)
         self.hunyuanLayoutActions = {}
-        for mode, label, tip in (
-            ("auto", "自动判断", "根据中缝和当前阅读方向选择单栏或双栏。"),
-            ("horizontal-single", "横排单栏", "整栏送入 Hunyuan，按自上而下读取。"),
-            ("horizontal-two", "横排双栏（左→右）", "左右栏分别送入 Hunyuan，再按左栏、右栏合并。"),
-            ("vertical-single", "竖排单栏", "整栏送入 Hunyuan，按从右到左、每列从上到下读取。"),
-            ("vertical-two", "竖排双栏（右→左）", "左右栏分别送入 Hunyuan，再按右栏、左栏合并。"),
-        ):
+        for mode, label, tip in HunyuanLayout.options():
             layout_action = action(
                 label,
                 partial(self.setHunyuanLayoutMode, mode),
@@ -1501,6 +1504,22 @@ class MainWindow(QMainWindow):
         self.autoRecognitionMenu.addAction(self.hunyuanAction)
         self.autoRecognitionMenu.addAction(self.qwenAction)
         self.autoRecognitionMenu.addMenu(self.hunyuanLayoutMenu)
+        self.hunyuanLineModeAction = action(
+            "逐行裁条识别（框文严格对应）",
+            self.toggleHunyuanLineMode,
+            tip="按印刷行逐条裁图单独识别：框与文严格对应，页码、书眉也能读到；速度约为整页识别的 2 倍。",
+            checkable=True,
+        )
+        self.hunyuanLineModeAction.setChecked(self.hunyuan_line_mode)
+        self.autoRecognitionMenu.addAction(self.hunyuanLineModeAction)
+        self.hunyuanIpaModeAction = action(
+            "音标页识别（国际音标）",
+            self.toggleHunyuanIpaMode,
+            tip="方言词典/音标页专用提示词：声调用五度调符 ˥˦˧˨˩，音标用标准国际音标字符，禁止用注音符号或拼音代替。",
+            checkable=True,
+        )
+        self.hunyuanIpaModeAction.setChecked(self.hunyuan_ipa_mode)
+        self.autoRecognitionMenu.addAction(self.hunyuanIpaModeAction)
         self.twoColumnLRAction = action(
             get_str("twoColumnLR"),
             self.toggleTwoColumnLR,
@@ -2505,6 +2524,7 @@ class MainWindow(QMainWindow):
         self.indexList.addItem(current_index)
         self.labelList.addItem(item)
         self._update_label_item_style(shape)
+        self._fit_label_item_height(item)
         # print('item in add label is ',[(p.x(), p.y()) for p in shape.points], shape.label)
 
         # ADD for box
@@ -2739,6 +2759,31 @@ class MainWindow(QMainWindow):
             return updated
         return result
 
+    def _fit_label_item_height(self, item, view=None):
+        """Grow a result-list row so a long label wraps instead of being clipped.
+
+        A merged two-line recognition result arrives as one long box text;
+        QListWidget does not enlarge the row for wrapped text on its own, so the
+        tail used to stay hidden.
+        """
+        view = view if view is not None else self.labelList
+        if item is None or view is None:
+            return
+        try:
+            metrics = view.fontMetrics()
+            width = max(60, view.viewport().width() - 16)
+            rect = metrics.boundingRect(
+                0,
+                0,
+                width,
+                100000,
+                Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop,
+                item.text() or "",
+            )
+            item.setSizeHint(QSize(view.sizeHintForColumn(0) or width, rect.height() + 6))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Unable to size a label row: %s", exc)
+
     def _update_label_item_style(self, shape):
         item = self.shapesToItems.get(shape)
         if not item:
@@ -2788,6 +2833,10 @@ class MainWindow(QMainWindow):
 
         def sort_auto_results(results):
             if not results:
+                return results
+            if getattr(self, "result_order_from_model", False):
+                # 混元 / Qwen 的阅读顺序由模型自己给出（双栏按指定栏序合并），
+                # 再按坐标几何重排只会把段落顺序打乱。
                 return results
             if not (
                 getattr(self, "layout_first", False)
@@ -2997,6 +3046,7 @@ class MainWindow(QMainWindow):
                 previous_text=old_label,
             )
             self._update_label_item_style(shape)
+            self._fit_label_item_height(item)
             # shape.line_color = generateColorByText(shape.label)
             self.setDirty()
         elif (
@@ -4879,11 +4929,7 @@ class MainWindow(QMainWindow):
         )
 
     def setHunyuanLayoutMode(self, mode, _checked=False):
-        valid_modes = {
-            "auto", "horizontal-single", "horizontal-two",
-            "vertical-single", "vertical-two",
-        }
-        if mode not in valid_modes:
+        if not HunyuanLayout.is_valid(mode):
             return
         self.hunyuan_layout_mode = mode
         self.settings["hunyuan_layout_mode"] = mode
@@ -4891,7 +4937,31 @@ class MainWindow(QMainWindow):
         action = getattr(self, "hunyuanLayoutActions", {}).get(mode)
         if action:
             action.setChecked(True)
-        self.statusBar().showMessage(f"HunyuanOCR 版式：{mode}", 3000)
+        self.statusBar().showMessage(
+            f"混元 / Qwen 版式：{HunyuanLayout.label(mode)}", 3000
+        )
+
+    def toggleHunyuanLineMode(self, checked):
+        self.hunyuan_line_mode = bool(checked)
+        self.settings["hunyuan_line_mode"] = self.hunyuan_line_mode
+        self.settings.save()
+        self.statusBar().showMessage(
+            "逐行裁条识别：开（框文严格对应，较慢）"
+            if self.hunyuan_line_mode
+            else "逐行裁条识别：关（整页一次读）",
+            3000,
+        )
+
+    def toggleHunyuanIpaMode(self, checked):
+        self.hunyuan_ipa_mode = bool(checked)
+        self.settings["hunyuan_ipa_mode"] = self.hunyuan_ipa_mode
+        self.settings.save()
+        self.statusBar().showMessage(
+            "音标页识别：开（五度调符 + 国际音标字符表）"
+            if self.hunyuan_ipa_mode
+            else "音标页识别：关（用默认 OCR 提示词）",
+            3000,
+        )
 
     def togglePPStructure(self, checked):
         if checked:

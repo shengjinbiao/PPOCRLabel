@@ -110,9 +110,10 @@ PPOCRLabel parses each span into one rectangle:
 Coordinates are validated against the resized input image, then scaled back to
 the original image size.
 
-If coordinate parsing is incomplete, PPOCRLabel falls back to one full-page box.
-In that fallback path, coordinate pairs are stripped from the displayed text
-when possible.
+If coordinates are missing or incomplete, PPOCRLabel falls back to editable line
+boxes aligned to the image's ink bands in order; when the page cannot be aligned
+reliably it returns one full-page box. Coordinate pairs are stripped from the
+displayed text when possible.
 
 Recognition confidence is stored as `0.0` because HunyuanOCR does not return a
 calibrated OCR confidence score.
@@ -142,6 +143,37 @@ The UI option is stored as:
 ```text
 use_hunyuan_gguf
 ```
+
+The layout option is stored as `hunyuan_layout_mode` and validated against
+`libs/hunyuan_ocr.HunyuanLayout` (single source of truth for the menu, the
+dialog hints and the engine's accepted modes):
+
+```text
+page              整页识别（默认，不切栏）   默认值；整页一次，只用默认指令
+model-auto        模型自判版式               整页一次，请模型自判单/双栏
+horizontal-single 横排单栏
+horizontal-two    横排双栏（左→右）          唯一会裁栏合并的横排模式
+vertical-single   竖排单栏
+vertical-two      竖排双栏（右→左）          唯一会裁栏合并的竖排模式
+```
+
+A stored value of `auto` (the retired “program finds the gutter” behaviour) is
+normalized to `page` on startup. Recognised results are saved in the order the
+model returned them; no geometric re-sorting is applied to HunyuanOCR or Qwen
+output (`result_order_from_model`), only to PaddleOCR's two-column mode.
+
+The line-by-line mode is stored as `hunyuan_line_mode`. When enabled, every
+printed line is cropped and recognised on its own, so box and text match by
+construction and footers such as the page number are read too. It costs about
+twice the whole-page time (p010: 6.4s vs 10.2s) and is ignored for the two
+columns layout modes.
+
+The IPA mode is stored as `hunyuan_ipa_mode` (menu entry "音标页识别（国际音标）").
+It swaps the base prompt for `IPA_PROMPT`: tone values must use the five-level
+letters ˥ ˦ ˧ ˨ ˩ (never Zhuyin or pinyin), IPA letters must use the proper
+characters, Chinese stays traditional, and isolated small print is kept. It is
+independent of the layout mode and is recommended together with `--lines` for
+dense dictionary pages.
 
 When HunyuanOCR is enabled:
 

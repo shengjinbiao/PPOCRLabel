@@ -6,7 +6,7 @@ import threading
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QSize
 from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox as BB,
@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 )
 
 from libs.utils import newIcon
+from libs.hunyuan_ocr import HunyuanLayout
 
 logger = logging.getLogger("PPOCRLabel")
 
@@ -140,15 +141,23 @@ class Worker(QThread):
                         )
                         engine_name = "HunyuanOCR" if self.model == "hunyuan" else "Qwen OCR"
                         self.listValue.emit(f"{engine_name}：启动本地模型并识别，首次加载可能需要一些时间…")
-                        layout_mode = getattr(self.mainThread, "hunyuan_layout_mode", "auto")
-                        self.listValue.emit(f"{engine_name} 版式：{layout_mode}")
-                        self.listValue.emit("若模型返回坐标，将按坐标分框；双栏会分别识别后再合并。")
+                        layout_mode = getattr(self.mainThread, "hunyuan_layout_mode", "page")
+                        self.listValue.emit(
+                            f"{engine_name} 版式：{HunyuanLayout.LABELS.get(layout_mode, layout_mode)}"
+                        )
+                        self.listValue.emit(HunyuanLayout.detail(layout_mode))
+                        if getattr(self.mainThread, "hunyuan_line_mode", False):
+                            self.listValue.emit("逐行裁条识别：每条印刷行单独送模型，框与文严格对应（较慢）。")
+                        if getattr(self.mainThread, "hunyuan_ipa_mode", False):
+                            self.listValue.emit("音标页模式：用国际音标专用提示词（五度调符 + 音标字符表，禁止注音/拼音代替）。")
                         try:
                             self.result_dic = engine.recognize(
                                 img_path,
                                 layout_mode=layout_mode,
                                 reading_mode=getattr(self.mainThread, "reading_mode", "horizontal"),
                                 cancelled=lambda: self.handle != 0,
+                                line_mode=getattr(self.mainThread, "hunyuan_line_mode", False),
+                                ipa_mode=getattr(self.mainThread, "hunyuan_ipa_mode", False),
                             )
                         except Exception as exc:
                             logger.exception("%s failed for %s", engine_name, img_path)
@@ -202,6 +211,7 @@ class Worker(QThread):
                             if self.save_error:
                                 raise RuntimeError(self.save_error)
                         else:
+                            self.mainThread.result_order_from_model = False
                             self.mainThread.result_dic = self.result_dic
                             self.mainThread.filePath = img_path
                             self.mainThread.saveFile(mode="Auto")
@@ -313,7 +323,10 @@ class AutoDialog(QDialog):
         try:
             if self.thread_1.handle != 0:
                 return
-            self.parent.result_dic = self.parent.sort_ocr_result_entries(results)
+            # 视觉模型的阅读顺序由模型自己（或按指定栏序合并）给出，
+            # 保存前不再按坐标几何重排，否则会把段落顺序打乱。
+            self.parent.result_order_from_model = True
+            self.parent.result_dic = results
             self.parent.filePath = path
             self.parent.saveFile(mode="Auto")
         except Exception as exc:
@@ -326,6 +339,16 @@ class AutoDialog(QDialog):
         self.listWidget.addItem(i)
         titem = self.listWidget.item(self.listWidget.count() - 1)
         titem.setToolTip(i)
+        # 长文本（例如两行并成一行的识别结果）要让行高跟着换行长，否则尾部被遮住。
+        try:
+            metrics = self.listWidget.fontMetrics()
+            width = max(60, self.listWidget.viewport().width() - 16)
+            rect = metrics.boundingRect(
+                0, 0, width, 100000, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, i
+            )
+            titem.setSizeHint(QSize(width, rect.height() + 6))
+        except Exception:
+            pass
         self.listWidget.scrollToItem(titem)
 
     def handleEndsignalSignal(self, code, message):

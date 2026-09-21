@@ -15,7 +15,9 @@ from libs.hunyuan_ocr import (
     HunyuanOCR,
     HunyuanLengthLimit,
     ROOT as HUNYUAN_ROOT,
+    looks_like_model_meta,
     parse_coordinate_output,
+    strip_coord_template,
     strip_coordinate_pairs,
 )
 
@@ -89,7 +91,7 @@ class QwenOCR(HunyuanOCR):
             self.stop()
             raise
 
-    def _recognize_page(self, page, source_name, log_suffix, layout_hint="horizontal-single", cancelled=lambda: False):
+    def _recognize_page(self, page, source_name, log_suffix, layout_hint="page", cancelled=lambda: False, write_log=True):
         scale = min(1.0, 1536 / max(page.size))
         size = tuple(max(32, int(value * scale / 32) * 32) for value in page.size)
         model_page = page.resize(size, Image.Resampling.LANCZOS)
@@ -112,14 +114,15 @@ class QwenOCR(HunyuanOCR):
         choice = response.json()["choices"][0]
         text = choice["message"]["content"]
         log_dir = self.root / "logs"
-        log_stem = Path(source_name).stem[:60] + "-qwen" + log_suffix
-        (log_dir / (log_stem + "-result.json")).write_text(
-            json.dumps({"source": str(source_name), "input_size": size,
-                        "original_size": page.size, "layout_hint": layout_hint,
-                        "elapsed_seconds": time.monotonic() - started,
-                        "response": choice}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        log_stem = self._log_stem(source_name, "-qwen" + log_suffix)
+        if write_log:
+            (log_dir / (log_stem + "-result.json")).write_text(
+                json.dumps({"source": str(source_name), "input_size": size,
+                            "original_size": page.size, "layout_hint": layout_hint,
+                            "elapsed_seconds": time.monotonic() - started,
+                            "response": choice}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         if choice.get("finish_reason") == "length":
             raise HunyuanLengthLimit("Qwen OCR 输出达到长度限制")
         if not isinstance(text, str) or not text.strip():
@@ -130,5 +133,16 @@ class QwenOCR(HunyuanOCR):
                 return parsed
         except Exception as exc:
             logger.warning("Qwen OCR coordinate parsing failed; using visual line split: %s", exc)
-        plain_text = strip_coordinate_pairs(text) or text.strip()
-        return self._fallback_line_entries(page, plain_text, vertical=layout_hint.startswith("vertical"))
+        plain_text = strip_coord_template(
+            self._strip_meta_prefix(strip_coordinate_pairs(text) or text.strip())
+        )
+        if looks_like_model_meta(plain_text):
+            logger.warning(
+                "Qwen OCR replied with a refusal or a prompt echo for %s; skipping: %s",
+                source_name,
+                plain_text[:80],
+            )
+            return []
+        return self._fallback_line_entries(
+            page, plain_text, vertical=layout_hint.startswith("vertical")
+        )
