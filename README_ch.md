@@ -15,6 +15,12 @@ PPOCRLabelv3是一款适用于OCR领域的半自动化图形标注工具，内�
 | <img src="./data/gif/multi-point.gif" width="80%"/> |  <img src="./data/gif/kie.gif" width="100%"/>  |
 
 #### 近期更新
+- 2026.10:
+  - 自动识别新增四种可切换的视觉 OCR 引擎：**HunyuanOCR（混元 OCR）**、**Qwen OCR（千问 OCR）**、**HunyuanOCR 1.5（新版）** 和 **PaddleOCR-VL 1.6（新版）**。四种引擎互斥，切换时会释放其他视觉模型占用的显存；原有 PaddleOCR 与 PP-Structure 功能保持不变。
+  - HunyuanOCR 与 Qwen OCR 通过 PPOCRLabel 按需启动本地视觉模型服务，支持整页识别、双栏版式、逐行裁条识别及 IPA 音标页识别。逐行模式可使文本与标记框严格对应，适合页码、书眉和密集音标/音系页面。
+  - 新增 HunyuanOCR 1.5 独立接入，保留旧版混元模型不受影响；针对大页音标表优化了输出长度与重复惩罚，并改进 IPA、声调、上下标、附加符及音系对齐空白的保留。
+  - 新增 PaddleOCR-VL 1.6 的独立子进程接入，可将版面块文字和坐标返回至 PPOCRLabel 编辑；该功能使用独立 Python 环境，不会升级或替换当前 PaddleOCR。首次使用前需按本机 CUDA/驱动安装匹配的 Paddle GPU 依赖。
+  - 支持命令行视觉 OCR：`python scripts/vision_ocr.py --engine hunyuan15 --input <图片或PDF> --outdir <输出目录>` 或 `--engine paddle-vl`。
 - 2025.11:
   - 通过菜单启动的训练任务结束后会自动定位最新 checkpoint，运行 tools/export_model.py 将推理模型导出到当前输出目录的 inference_时间戳 子目录，自动写入自定义检测模型配置并立即重载 PaddleOCR/PP-Structure，新模型无需手动切换即可生效。
   - 识别结果面板支持双击文字唤出模型返回的候选字符列表，可直接点击替换字符；若暂时没有候选，则保持普通编辑体验，避免来回切换键盘输入。
