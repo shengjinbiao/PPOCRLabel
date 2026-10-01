@@ -133,23 +133,26 @@ class Worker(QThread):
                             img_path
                         )
 
-                    elif self.model in ("hunyuan", "qwen"):
-                        engine = (
-                            self.mainThread.hunyuan_engine
-                            if self.model == "hunyuan"
-                            else self.mainThread.qwen_engine
-                        )
-                        engine_name = "HunyuanOCR" if self.model == "hunyuan" else "Qwen OCR"
+                    elif self.model in ("hunyuan", "qwen", "hunyuan15", "paddle-vl"):
+                        engines = {
+                            "hunyuan": (self.mainThread.hunyuan_engine, "HunyuanOCR"),
+                            "qwen": (self.mainThread.qwen_engine, "Qwen OCR"),
+                            "hunyuan15": (self.mainThread.hunyuan15_engine, "HunyuanOCR 1.5"),
+                            "paddle-vl": (self.mainThread.paddleocr_vl_engine, "PaddleOCR-VL 1.6"),
+                        }
+                        engine, engine_name = engines[self.model]
                         self.listValue.emit(f"{engine_name}：启动本地模型并识别，首次加载可能需要一些时间…")
-                        layout_mode = getattr(self.mainThread, "hunyuan_layout_mode", "page")
-                        self.listValue.emit(
-                            f"{engine_name} 版式：{HunyuanLayout.LABELS.get(layout_mode, layout_mode)}"
-                        )
-                        self.listValue.emit(HunyuanLayout.detail(layout_mode))
-                        if getattr(self.mainThread, "hunyuan_line_mode", False):
-                            self.listValue.emit("逐行裁条识别：每条印刷行单独送模型，框与文严格对应（较慢）。")
-                        if getattr(self.mainThread, "hunyuan_ipa_mode", False):
-                            self.listValue.emit("音标页模式：用国际音标专用提示词（五度调符 + 音标字符表，禁止注音/拼音代替）。")
+                        is_hunyuan = self.model in ("hunyuan", "qwen", "hunyuan15")
+                        layout_mode = getattr(self.mainThread, "hunyuan_layout_mode", "page") if is_hunyuan else "page"
+                        if is_hunyuan:
+                            self.listValue.emit(
+                                f"{engine_name} 版式：{HunyuanLayout.LABELS.get(layout_mode, layout_mode)}"
+                            )
+                            self.listValue.emit(HunyuanLayout.detail(layout_mode))
+                            if getattr(self.mainThread, "hunyuan_line_mode", False):
+                                self.listValue.emit("逐行裁条识别：每条印刷行单独送模型，框与文严格对应（较慢）。")
+                            if getattr(self.mainThread, "hunyuan_ipa_mode", False):
+                                self.listValue.emit("音标页模式：用国际音标专用提示词（原样保留数字/五度调符、音标及附加符）。")
                         try:
                             self.result_dic = engine.recognize(
                                 img_path,
@@ -174,13 +177,13 @@ class Worker(QThread):
                         failed_paths.append(img_path)
                         pass
                     else:
-                        if self.model not in ("hunyuan", "qwen"):
+                        if self.model not in ("hunyuan", "qwen", "hunyuan15", "paddle-vl"):
                             self.result_dic = (
                                 self.mainThread.refine_ocr_result_entries_by_crops(
                                     img, self.result_dic
                                 )
                             )
-                        if self.model not in ("hunyuan", "qwen"):
+                        if self.model not in ("hunyuan", "qwen", "hunyuan15", "paddle-vl"):
                             self.result_dic = self.mainThread.sort_ocr_result_entries(
                                 self.result_dic
                             )
@@ -200,7 +203,7 @@ class Worker(QThread):
                             )
                         # Sending large amounts of data repeatedly through pyqtSignal may affect the program efficiency
                         self.listValue.emit(strs)
-                        if self.model in ("hunyuan", "qwen"):
+                        if self.model in ("hunyuan", "qwen", "hunyuan15", "paddle-vl"):
                             # All Qt-backed sorting and saving stays on the GUI thread.
                             self.pageSaved.clear()
                             self.save_error = None
@@ -255,6 +258,10 @@ class Worker(QThread):
                 self.mainThread.hunyuan_engine.stop()
             elif self.model == "qwen" and self.mainThread.qwen_engine is not None:
                 self.mainThread.qwen_engine.stop()
+            elif self.model == "hunyuan15" and self.mainThread.hunyuan15_engine is not None:
+                self.mainThread.hunyuan15_engine.stop()
+            elif self.model == "paddle-vl" and self.mainThread.paddleocr_vl_engine is not None:
+                self.mainThread.paddleocr_vl_engine.stop()
 
 
 class AutoDialog(QDialog):
@@ -365,6 +372,10 @@ class AutoDialog(QDialog):
             self.parent.hunyuan_engine.stop()
         elif self.model == "qwen" and self.parent.qwen_engine is not None:
             self.parent.qwen_engine.stop()
+        elif self.model == "hunyuan15" and self.parent.hunyuan15_engine is not None:
+            self.parent.hunyuan15_engine.stop()
+        elif self.model == "paddle-vl" and self.parent.paddleocr_vl_engine is not None:
+            self.parent.paddleocr_vl_engine.stop()
         self.thread_1.quit()
         self.buttonBox.setEnabled(False)
         while not self.thread_1.wait(50):

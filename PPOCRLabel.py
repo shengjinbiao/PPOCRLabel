@@ -398,10 +398,21 @@ class MainWindow(QMainWindow):
             )
         self.hunyuan_engine = None
         self.qwen_engine = None
+        self.hunyuan15_engine = None
+        self.paddleocr_vl_engine = None
         self.use_hunyuan = bool(settings.get("use_hunyuan_gguf", False))
         self.use_qwen = bool(settings.get("use_qwen_ocr_lmstudio", False))
+        self.use_hunyuan15 = bool(settings.get("use_hunyuan15_gguf", False))
+        self.use_paddleocr_vl = bool(settings.get("use_paddleocr_vl", False))
         if self.use_qwen:
             self.use_hunyuan = False
+        if self.use_hunyuan15:
+            self.use_hunyuan = False
+            self.use_qwen = False
+        if self.use_paddleocr_vl:
+            self.use_hunyuan = False
+            self.use_qwen = False
+            self.use_hunyuan15 = False
         # 混元 / Qwen 版式：默认整页识别（不切栏、不重排）；
         # 旧设置里的 "auto"（程序自己算中缝）已退役，统一归一化到当前模式表。
         self.hunyuan_layout_mode = HunyuanLayout.normalize(
@@ -409,9 +420,11 @@ class MainWindow(QMainWindow):
         )
         # 逐行裁条识别：每条印刷行单独送模型，框与文严格对应（较慢）。
         self.hunyuan_line_mode = bool(settings.get("hunyuan_line_mode", False))
-        # 音标页模式：IPA 专用提示词（五度调符 + 国际音标字符表，禁注音/拼音代替）。
+        # 音标页模式：IPA 专用提示词（保留原有调号写法、国际音标字符和附加符）。
         self.hunyuan_ipa_mode = bool(settings.get("hunyuan_ipa_mode", False))
-        self.use_ppstructure = bool(stored_ppstructure) and not self.use_hunyuan
+        self.use_ppstructure = bool(stored_ppstructure) and not any(
+            (self.use_hunyuan, self.use_qwen, self.use_hunyuan15, self.use_paddleocr_vl)
+        )
         self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
         stored_two_col = settings.get(SETTING_TWO_COLUMN_LR, False)
         if isinstance(stored_two_col, str):
@@ -1485,6 +1498,20 @@ class MainWindow(QMainWindow):
             checkable=True,
         )
         self.qwenAction.setChecked(self.use_qwen)
+        self.hunyuan15Action = action(
+            "使用 HunyuanOCR 1.5（新版）",
+            self.toggleHunyuan15,
+            tip="独立安装的 HunyuanOCR 1.5；不会替换现有 HunyuanOCR。",
+            checkable=True,
+        )
+        self.hunyuan15Action.setChecked(self.use_hunyuan15)
+        self.paddleOCRVLAction = action(
+            "使用 PaddleOCR-VL 1.6（新版）",
+            self.togglePaddleOCRVL,
+            tip="独立 PaddleOCR-VL 环境，返回版面块与文字；不会升级或替换当前 PaddleOCR。",
+            checkable=True,
+        )
+        self.paddleOCRVLAction.setChecked(self.use_paddleocr_vl)
         self.hunyuanLayoutMenu = QMenu("混元 / Qwen OCR 版式", self)
         self.hunyuanLayoutActionGroup = QActionGroup(self)
         self.hunyuanLayoutActionGroup.setExclusive(True)
@@ -1503,6 +1530,8 @@ class MainWindow(QMainWindow):
         self.autoRecognitionMenu.addSeparator()
         self.autoRecognitionMenu.addAction(self.hunyuanAction)
         self.autoRecognitionMenu.addAction(self.qwenAction)
+        self.autoRecognitionMenu.addAction(self.hunyuan15Action)
+        self.autoRecognitionMenu.addAction(self.paddleOCRVLAction)
         self.autoRecognitionMenu.addMenu(self.hunyuanLayoutMenu)
         self.hunyuanLineModeAction = action(
             "逐行裁条识别（框文严格对应）",
@@ -1515,7 +1544,7 @@ class MainWindow(QMainWindow):
         self.hunyuanIpaModeAction = action(
             "音标页识别（国际音标）",
             self.toggleHunyuanIpaMode,
-            tip="方言词典/音标页专用提示词：声调用五度调符 ˥˦˧˨˩，音标用标准国际音标字符，禁止用注音符号或拼音代替。",
+            tip="方言词典/音标页专用提示词：原样保留数字/上标数字或五度调符，严格区分国际音标及其上标、下标和附加符。",
             checkable=True,
         )
         self.hunyuanIpaModeAction.setChecked(self.hunyuan_ipa_mode)
@@ -2014,6 +2043,12 @@ class MainWindow(QMainWindow):
     def _ensure_ocr_models_loaded(self):
         if self.hunyuan_engine is not None:
             self.hunyuan_engine.stop()
+        if self.qwen_engine is not None:
+            self.qwen_engine.stop()
+        if self.hunyuan15_engine is not None:
+            self.hunyuan15_engine.stop()
+        if self.paddleocr_vl_engine is not None:
+            self.paddleocr_vl_engine.stop()
         if not getattr(self, "_models_loaded", False):
             self.statusBar().showMessage(self.get_str("loadingModels"))
             self._load_ocr_models()
@@ -2036,6 +2071,12 @@ class MainWindow(QMainWindow):
             return
         if self.hunyuan_engine is not None:
             self.hunyuan_engine.stop()
+        if self.qwen_engine is not None:
+            self.qwen_engine.stop()
+        if self.hunyuan15_engine is not None:
+            self.hunyuan15_engine.stop()
+        if self.paddleocr_vl_engine is not None:
+            self.paddleocr_vl_engine.stop()
         if dialog is not None:
             dialog.ocr = None
             if worker is not None:
@@ -3481,6 +3522,12 @@ class MainWindow(QMainWindow):
         else:
             if self.hunyuan_engine is not None:
                 self.hunyuan_engine.stop()
+            if self.qwen_engine is not None:
+                self.qwen_engine.stop()
+            if self.hunyuan15_engine is not None:
+                self.hunyuan15_engine.stop()
+            if self.paddleocr_vl_engine is not None:
+                self.paddleocr_vl_engine.stop()
             settings = self.settings
             # If it loads images from dir, don't load it at the beginning
             if self.dirname is None:
@@ -4296,7 +4343,7 @@ class MainWindow(QMainWindow):
 
     def autoRecognition(self):
         assert self.mImgList is not None
-        if not self.use_hunyuan and not self.use_qwen:
+        if not any((self.use_hunyuan, self.use_qwen, self.use_hunyuan15, self.use_paddleocr_vl)):
             self._ensure_ocr_models_loaded()
         logger.info("Using model from %s", self.model)
 
@@ -4308,7 +4355,7 @@ class MainWindow(QMainWindow):
 
     def autoRecognitionCurrent(self):
         assert self.mImgList is not None
-        if not self.use_hunyuan and not self.use_qwen:
+        if not any((self.use_hunyuan, self.use_qwen, self.use_hunyuan15, self.use_paddleocr_vl)):
             self._ensure_ocr_models_loaded()
         if not self.mImgList:
             return
@@ -4375,14 +4422,38 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Qwen OCR", str(exc))
                 return
             self.unload_ocr_models()
+        elif self.use_hunyuan15:
+            from libs.hunyuan15_ocr import HunyuanOCR15
+
+            if self.hunyuan15_engine is None:
+                self.hunyuan15_engine = HunyuanOCR15()
+            try:
+                self.hunyuan15_engine.check_files()
+            except Exception as exc:
+                QMessageBox.warning(self, "HunyuanOCR 1.5", str(exc))
+                return
+            self.unload_ocr_models()
+        elif self.use_paddleocr_vl:
+            from libs.paddleocr_vl import PaddleOCRVL
+
+            if self.paddleocr_vl_engine is None:
+                self.paddleocr_vl_engine = PaddleOCRVL()
+            try:
+                self.paddleocr_vl_engine.check_files()
+            except Exception as exc:
+                QMessageBox.warning(self, "PaddleOCR-VL", str(exc))
+                return
+            self.unload_ocr_models()
         self.autoDialog = AutoDialog(
             parent=self,
-            ocr=None if (self.use_hunyuan or self.use_qwen) else self.ocr,
+            ocr=None if any((self.use_hunyuan, self.use_qwen, self.use_hunyuan15, self.use_paddleocr_vl)) else self.ocr,
             image_list=uncheckedList,
             len_bar=len(uncheckedList),
             model=(
                 "hunyuan" if self.use_hunyuan else
                 "qwen" if self.use_qwen else
+                "hunyuan15" if self.use_hunyuan15 else
+                "paddle-vl" if self.use_paddleocr_vl else
                 ("ppstructure" if self.use_ppstructure else "paddle")
             ),
         )
@@ -4890,19 +4961,35 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(message, 3000)
 
+    def _select_visual_ocr(self, selected):
+        """Keep optional visual engines mutually exclusive without deleting them."""
+        engines = (
+            ("hunyuan", "use_hunyuan", "use_hunyuan_gguf", "hunyuanAction", "hunyuan_engine"),
+            ("qwen", "use_qwen", "use_qwen_ocr_lmstudio", "qwenAction", "qwen_engine"),
+            ("hunyuan15", "use_hunyuan15", "use_hunyuan15_gguf", "hunyuan15Action", "hunyuan15_engine"),
+            ("paddle-vl", "use_paddleocr_vl", "use_paddleocr_vl", "paddleOCRVLAction", "paddleocr_vl_engine"),
+        )
+        for key, flag, setting, action_name, engine_name in engines:
+            enabled = key == selected
+            setattr(self, flag, enabled)
+            self.settings[setting] = enabled
+            action = getattr(self, action_name, None)
+            if action is not None and action.isChecked() != enabled:
+                action.setChecked(enabled)
+            if not enabled:
+                engine = getattr(self, engine_name, None)
+                if engine is not None:
+                    engine.stop()
+        self.ppstructureAction.setChecked(False)
+        self.use_ppstructure = False
+        self.settings[SETTING_USE_PPSTRUCTURE] = False
+        self.unload_ocr_models()
+
     def toggleHunyuan(self, checked):
         self.use_hunyuan = bool(checked)
         self.settings["use_hunyuan_gguf"] = self.use_hunyuan
         if checked:
-            self.qwenAction.setChecked(False)
-            self.use_qwen = False
-            self.settings["use_qwen_ocr_lmstudio"] = False
-            if self.qwen_engine is not None:
-                self.qwen_engine.stop()
-            self.ppstructureAction.setChecked(False)
-            self.use_ppstructure = False
-            self.settings[SETTING_USE_PPSTRUCTURE] = False
-            self.unload_ocr_models()
+            self._select_visual_ocr("hunyuan")
         elif self.hunyuan_engine is not None:
             self.hunyuan_engine.stop()
         self.settings.save()
@@ -4912,20 +4999,36 @@ class MainWindow(QMainWindow):
         self.use_qwen = bool(checked)
         self.settings["use_qwen_ocr_lmstudio"] = self.use_qwen
         if checked:
-            self.hunyuanAction.setChecked(False)
-            self.use_hunyuan = False
-            self.settings["use_hunyuan_gguf"] = False
-            if self.hunyuan_engine is not None:
-                self.hunyuan_engine.stop()
-            self.ppstructureAction.setChecked(False)
-            self.use_ppstructure = False
-            self.settings[SETTING_USE_PPSTRUCTURE] = False
-            self.unload_ocr_models()
+            self._select_visual_ocr("qwen")
         elif self.qwen_engine is not None:
             self.qwen_engine.stop()
         self.settings.save()
         self.statusBar().showMessage(
             "已选择 Qwen OCR" if checked else "已取消 Qwen OCR"
+        )
+
+    def toggleHunyuan15(self, checked):
+        self.use_hunyuan15 = bool(checked)
+        self.settings["use_hunyuan15_gguf"] = self.use_hunyuan15
+        if checked:
+            self._select_visual_ocr("hunyuan15")
+        elif self.hunyuan15_engine is not None:
+            self.hunyuan15_engine.stop()
+        self.settings.save()
+        self.statusBar().showMessage(
+            "已选择 HunyuanOCR 1.5" if checked else "已取消 HunyuanOCR 1.5"
+        )
+
+    def togglePaddleOCRVL(self, checked):
+        self.use_paddleocr_vl = bool(checked)
+        self.settings["use_paddleocr_vl"] = self.use_paddleocr_vl
+        if checked:
+            self._select_visual_ocr("paddle-vl")
+        elif self.paddleocr_vl_engine is not None:
+            self.paddleocr_vl_engine.stop()
+        self.settings.save()
+        self.statusBar().showMessage(
+            "已选择 PaddleOCR-VL 1.6" if checked else "已取消 PaddleOCR-VL 1.6"
         )
 
     def setHunyuanLayoutMode(self, mode, _checked=False):
@@ -4957,7 +5060,7 @@ class MainWindow(QMainWindow):
         self.settings["hunyuan_ipa_mode"] = self.hunyuan_ipa_mode
         self.settings.save()
         self.statusBar().showMessage(
-            "音标页识别：开（五度调符 + 国际音标字符表）"
+            "音标页识别：开（原样调号 + 国际音标及附加符）"
             if self.hunyuan_ipa_mode
             else "音标页识别：关（用默认 OCR 提示词）",
             3000,
@@ -4971,10 +5074,20 @@ class MainWindow(QMainWindow):
             self.qwenAction.setChecked(False)
             self.use_qwen = False
             self.settings["use_qwen_ocr_lmstudio"] = False
+            self.hunyuan15Action.setChecked(False)
+            self.use_hunyuan15 = False
+            self.settings["use_hunyuan15_gguf"] = False
+            self.paddleOCRVLAction.setChecked(False)
+            self.use_paddleocr_vl = False
+            self.settings["use_paddleocr_vl"] = False
             if self.hunyuan_engine is not None:
                 self.hunyuan_engine.stop()
             if self.qwen_engine is not None:
                 self.qwen_engine.stop()
+            if self.hunyuan15_engine is not None:
+                self.hunyuan15_engine.stop()
+            if self.paddleocr_vl_engine is not None:
+                self.paddleocr_vl_engine.stop()
         self.use_ppstructure = bool(checked)
         self.settings[SETTING_USE_PPSTRUCTURE] = self.use_ppstructure
         self.settings.save()

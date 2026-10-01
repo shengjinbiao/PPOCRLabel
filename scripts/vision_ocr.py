@@ -45,12 +45,12 @@ LOCK_PATH = ROOT / "tools" / "hunyuan" / "logs" / ".vision_ocr.lock"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visual-model OCR (HunyuanOCR / Qwen) for PDFs or page images."
+        description="Visual-model OCR (HunyuanOCR / HunyuanOCR 1.5 / Qwen / PaddleOCR-VL) for PDFs or page images."
     )
     parser.add_argument("--input", required=True, nargs="+",
                         help="PDF file(s), one image, or a folder of page images.")
     parser.add_argument("--outdir", required=True, help="Output directory.")
-    parser.add_argument("--engine", default="hunyuan", choices=("hunyuan", "qwen"),
+    parser.add_argument("--engine", default="hunyuan", choices=("hunyuan", "hunyuan15", "qwen", "paddle-vl"),
                         help="Visual model to use (default: hunyuan).")
     parser.add_argument("--layout", default=HunyuanLayout.DEFAULT,
                         choices=tuple(HunyuanLayout.ORDER),
@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lines", action="store_true",
                         help="Recognise every printed line on its own (exact 1:1 boxes, ~2x slower).")
     parser.add_argument("--ipa", action="store_true",
-                        help="IPA-aware prompt for dialect dictionaries: tone letters "
-                             "˥˦˧˨˩ plus the IPA charset, no Zhuyin/pinyin substitutes "
+                        help="IPA-aware prompt for dialect dictionaries: preserve printed "
+                             "tone letters/numbers, IPA characters, and modifiers exactly "
                              "(recommended together with --lines).")
     parser.add_argument("--pages", default="",
                         help="PDF page range, e.g. 3,5-9 (1-based; default: all pages).")
@@ -205,6 +205,12 @@ def build_engine(name: str):
     if name == "hunyuan":
         from libs.hunyuan_ocr import HunyuanOCR
         return HunyuanOCR(), "HunyuanOCR"
+    if name == "hunyuan15":
+        from libs.hunyuan15_ocr import HunyuanOCR15
+        return HunyuanOCR15(), "HunyuanOCR 1.5"
+    if name == "paddle-vl":
+        from libs.paddleocr_vl import PaddleOCRVL
+        return PaddleOCRVL(), "PaddleOCR-VL 1.6"
     from libs.qwen_ocr import QwenOCR
     return QwenOCR(), "Qwen OCR"
 

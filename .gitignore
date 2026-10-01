@@ -163,6 +163,7 @@ cython_debug/
 
 # Downloaded local OCR runtimes, weights, and inference logs
 /tools/hunyuan/
+/tools/hunyuan15/
 /tmp/
 /test/
 /oracle-images/

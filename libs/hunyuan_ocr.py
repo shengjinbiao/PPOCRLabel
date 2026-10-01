@@ -41,12 +41,21 @@ META_MARKERS = (
 
 IPA_PROMPT = (
     "识别图片中的文字，按阅读顺序逐行输出，不要合并行、不要解释。"
-    "本页是汉语方言学著作，含国际音标与声调符号，请严格按下述要求转写："
-    "1）声调一律用五度调符 ˥ ˦ ˧ ˨ ˩ 表示，例如 [˦˦]、[˨˦]、[˨˩˧]、[˥˧]；"
-    "绝对不要用注音符号（ㄧㄨㄩㄚㄛㄜㄝ…）或拼音字母代替调符。"
-    "2）音标字母用标准国际音标字符逐字转写：ŋ ɕ ʑ ʨ ʨʰ ʦ ʦʰ ʂ ʐ ɿ ʅ ɚ ɛ ɔ ɤ ɐ ɑ æ ə ʰ ʷ ʲ ̃；"
-    "不要用近似拉丁字母代替（不要把 ɕ 写成 x、不要把 ʨ 写成 j、不要省略 ʰ）。"
-    "3）汉字照原样（繁体）转写，不要转成简体；页眉、页码、书耳等孤立小字也要输出。"
+    "本页以普通汉字正文为主：优先准确转写所有汉字（包括繁体）、标点、数字和普通拉丁字母，"
+    "不要把普通正文猜成音标或改写成拼音；页眉、页码、书耳等孤立小字也要输出。"
+    "仅当原图局部实际出现国际音标、声调或音系例项时，才对该局部按下述规则逐字忠实转写，"
+    "不得根据汉语拼音、普通话读音或音系知识猜测、规范化、改写或补全。"
+    "1）声调按原样保留：五度调符 ˥ ˦ ˧ ˨ ˩ 的顺序和重复次数照抄；"
+    "普通数字与上标数字 ⁰¹²³⁴⁵⁶⁷⁸⁹ 也照原样保留。"
+    "例如 55、213、¹³、[˨˩˧] 分别照抄，绝不把数字调值改成五度调符，"
+    "也绝不把五度调符改成数字、注音符号或拼音。"
+    "2）音标局部逐字符转写，常见字符有 ŋ ȵ ɳ、ʦ ʦʰ ʣ、ʈʂ ʈʂʰ ʂ ʐ、"
+    "ʨ ʨʰ ɕ ʑ tɕ tɕʰ、ɿ ʅ ɚ ə ɤ ɐ ɛ ɔ ɑ æ ɯ ʮ ɥ。"
+    "严格区分 ŋ 与 g、ȵ 与 n、ɕ 与 c/x、ʨ 与 j、ʦ 与 c、ʂ 与 s、ʐ 与 z。"
+    "3）音标局部的上标、下标和组合附加符必须原样保留位置及个数；特别注意 ʰ ʷ ʲ ⁿ ˀ ̃ ̩ ̍"
+    "以及上标/下标数字，不得省略、改成普通字母或移到别的字母上。"
+    "4）仅在音系项目行中，保留音标、调值或例项之间原有的明显空挡（空格或制表符）；"
+    "普通汉字正文按正常文字排版输出，不自行增加空格，也不要把空挡改成表格标记。"
 )
 
 # 印刷行/墨迹带的尺度门槛
@@ -253,6 +262,12 @@ class HunyuanLayout:
 
 
 class HunyuanOCR:
+    # Subclasses may use the common transport/parser with a different local
+    # llama.cpp model alias (for example HunyuanOCR-1.5).
+    server_alias = "hunyuanocr"
+    max_tokens = 12288
+    repeat_penalty = None
+
     def __init__(self, root=ROOT, line_mode=False, ipa_mode=False):
         self.root = Path(root)
         self.process = None
@@ -260,7 +275,7 @@ class HunyuanOCR:
         self.url = None
         self.cancelled = False
         self.line_mode = bool(line_mode)
-        # 音标页模式：用 IPA 专用提示词（五度调符 + 国际音标字符表，禁止注音/拼音代替）。
+        # 音标页模式：用 IPA 专用提示词（保留原有调号、行内空挡、IPA 字符和附加符）。
         self.ipa_mode = bool(ipa_mode)
         atexit.register(self.stop)
 
@@ -310,7 +325,7 @@ class HunyuanOCR:
         self.log_file = (log_dir / "server.log").open("ab")
         command = [str(server), "-m", str(model), "--mmproj", str(projector),
                    "--host", "127.0.0.1", "--port", str(port),
-                   "--alias", "hunyuanocr", "-ngl", "99", "-c", "16384",
+                   "--alias", self.server_alias, "-ngl", "99", "-c", "16384",
                    "--parallel", "1", "-b", "256", "-ub", "128",
                    "--flash-attn", "on", "--temp", "0", "--jinja"]
         self.process = subprocess.Popen(
@@ -444,20 +459,23 @@ class HunyuanOCR:
     @staticmethod
     def _wrap_fallback_text(text, count):
         """Break an unsegmented model response into reviewable text rows."""
-        compact = "".join((text or "").split())
-        if not compact or count <= 1:
-            return [compact] if compact else []
-        target = max(8, int(np.ceil(len(compact) / count)))
+        # Newlines only delimit model output rows.  Keep spaces and tabs inside
+        # a row: they can encode phonetic alignment in dictionary pages.
+        preserved = "".join((text or "").splitlines())
+        visible = "".join(preserved.split())
+        if not visible or count <= 1:
+            return [preserved] if visible else []
+        target = max(8, int(np.ceil(len(preserved) / count)))
         punctuation = set("，。；：！？、）】》」』\"”")
         lines, start = [], 0
-        while start < len(compact) and len(lines) < count - 1:
-            ideal = min(len(compact) - 1, start + target)
-            limit = min(len(compact) - 1, start + int(target * 1.35))
-            cut = next((index + 1 for index in range(ideal, limit + 1) if compact[index] in punctuation), ideal)
-            lines.append(compact[start:cut])
+        while start < len(preserved) and len(lines) < count - 1:
+            ideal = min(len(preserved) - 1, start + target)
+            limit = min(len(preserved) - 1, start + int(target * 1.35))
+            cut = next((index + 1 for index in range(ideal, limit + 1) if preserved[index] in punctuation), ideal)
+            lines.append(preserved[start:cut])
             start = cut
-        if start < len(compact):
-            lines.append(compact[start:])
+        if start < len(preserved):
+            lines.append(preserved[start:])
         return lines
 
     def _fallback_line_entries(self, page, text, vertical=False):
@@ -473,7 +491,12 @@ class HunyuanOCR:
         layout can never silently reorder the text.
         """
         width, height = page.size
+        # Use a whitespace-free copy only to decide whether the response is
+        # substantial enough to align with the page.  The actual text passed to
+        # the line allocator keeps internal spaces/tabs, which may be phonetic
+        # alignment rather than disposable word spacing.
         compact = "".join((text or "").split())
+        preserved = "".join((text or "").splitlines())
         full_page_box = [
             [[[0, 0], [width, 0], [width, height], [0, height]], (text.strip(), 0.0)]
         ]
@@ -496,7 +519,7 @@ class HunyuanOCR:
             # 模型正好一行对一行：直接采用它的行界。
             pieces = model_lines
         else:
-            pieces = self._allocate_lines(compact, [band["span"] for band in bands])
+            pieces = self._allocate_lines(preserved, [band["span"] for band in bands])
         entries = []
         for piece, band in zip(pieces, bands):
             x0, x1 = band["x0"], band["x1"]
@@ -681,13 +704,15 @@ class HunyuanOCR:
         buffer = io.BytesIO()
         model_page.save(buffer, format="PNG")
         payload = {
-            "model": "hunyuanocr", "temperature": 0, "max_tokens": 12288,
+            "model": self.server_alias, "temperature": 0, "max_tokens": self.max_tokens,
             "messages": [{"role": "system", "content": ""}, {"role": "user", "content": [
                 {"type": "image_url", "image_url": {
                     "url": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")}},
                 {"type": "text", "text": self._layout_prompt(layout_hint)},
             ]}],
         }
+        if self.repeat_penalty is not None:
+            payload["repeat_penalty"] = self.repeat_penalty
         started = time.monotonic()
         try:
             response = requests.post(self.url + "/v1/chat/completions", json=payload,
